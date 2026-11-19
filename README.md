@@ -73,6 +73,8 @@ python -m venv .build-venv
 
 独立运行产物：`build/portable/portable_entry.dist/RedisDesk.exe`。请保留整个目录。允许清单归档与 ZIP/SHA256 由 `scripts/stage_portable.py` 生成；流程与验收限制见 [内部便携说明](docs/INTERNAL_PORTABLE.md)。构建/发布/工件目录只留在本机，不纳入版本库。
 
+Windows 安装包（未签名内部预览）由 `scripts/build_installer.ps1` 和 `scripts/redisdesk-installer.iss` 从上述独立运行目录生成，输出 `release/RedisDesk-1.0.0-internal-win64-setup.exe`。说明、限制和数据目录见 [内部安装包说明](docs/INTERNAL_INSTALLER.md)。
+
 这是未代码签名的内部预览，不含安装包或自动更新。另一台未安装 Python/VS 的干净 Windows 机器仍需单独验收。不要绕过 Windows 安全提示或关闭杀毒软件。便携入口默认数据目录为 `%LOCALAPPDATA%\RedisDesk-Internal\1.0.0`，与开发数据分离。
 
 ## 当前实现状态

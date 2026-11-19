@@ -1,0 +1,17 @@
+# RedisDesk 1.0.0 内部安装包说明（未签名）
+
+这是 **未代码签名的内部预览安装包**，不是正式发行版，也不是自动更新程序。不要绕过 Windows 安全提示或关闭杀毒软件。若安全软件拦截，请停止安装并联系分发方。
+
+版本 1.0.0 来自现有项目元数据，不是新的稳定发布声明。本安装包只部署已审查的独立运行程序文件、许可证与说明，**不包含**连接、密码、密钥、`.env`、数据库、审计日志或用户设置。
+
+安装向导可使用简体中文。默认安装目录在未提升权限时为 `%LOCALAPPDATA%\Programs\RedisDesk`，也可自行选择其他目录；如选择为所有用户安装到 Program Files，向导会请求管理员权限。开始菜单会创建快捷方式；桌面快捷方式为可选项，默认不勾选。卸载项会写入“应用和功能 / 程序和功能”，显示版本 1.0.0。
+
+用户数据默认仍使用独立目录：
+
+`%LOCALAPPDATA%\RedisDesk-Internal\1.0.0`
+
+这不会迁移或覆盖开发环境使用的 `%LOCALAPPDATA%\RedisDesk`。可用环境变量 `REDISDESK_APPDATA` 覆盖数据目录。卸载程序 **不会删除** 上述用户数据。DPAPI 保存的凭据绑定当前 Windows 用户和机器，不要在机器间复制数据目录。同一 Windows 会话中只应运行一个 RedisDesk 实例；安装或启动前请自行完全退出已在运行的程序。安装程序不会强制结束正在运行的 RedisDesk。
+
+本安装包没有自动更新。安装包与其中的 RedisDesk.exe 均未签名。尚未在未安装 Python/VS 的干净 Windows 机器上做验收。Qt/PySide6 按适用的开源 LGPLv3 条款使用；请保留安装目录中的 `LICENSES` 与第三方声明。
+
+编译安装包请使用已存在的独立运行目录 `release\RedisDesk-1.0.0-internal-win64-portable`，运行 `scripts\build_installer.ps1`。不要把开发用 `.venv` 或 `artifacts`、用户数据打进安装包。安装 Inno Setup 仅用于在本机编译；商业使用场景下，Inno Setup 作者请求（并非强制要求在预览阶段购买）购买商业许可证，详见 https://jrsoftware.org/inno-setup/purchase
