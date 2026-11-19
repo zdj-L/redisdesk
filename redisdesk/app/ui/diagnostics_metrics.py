@@ -16,6 +16,8 @@ CARD_CLIENTS = "\u5ba2\u6237\u7aef"
 CARD_PERSIST = "\u6301\u4e45\u5316"
 CARD_REPLICATION = "\u590d\u5236"
 CARD_KEYSPACE = "\u952e\u7a7a\u95f4"
+SECTION_SLOWLOG = "\u6162\u67e5\u8be2"
+SECTION_CLIENT_LIST = "\u5ba2\u6237\u7aef\u5217\u8868"
 
 # Single-column page order. A two-column row grid left a hole under shorter
 # sections; masonry is denser but less even. Suitability beats density.
@@ -28,6 +30,8 @@ SECTION_ORDER: tuple[str, ...] = (
     CARD_REPLICATION,
     CARD_KEYSPACE,
 )
+# List sections follow the seven INFO groups and are not part of build_card_pairs.
+PAGE_SECTION_ORDER: tuple[str, ...] = SECTION_ORDER + (SECTION_SLOWLOG, SECTION_CLIENT_LIST)
 
 _MODE_LABELS = {
     "standalone": "\u5355\u673a\uff08standalone\uff09",

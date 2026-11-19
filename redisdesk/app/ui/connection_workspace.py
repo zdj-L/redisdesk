@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
 )
 
 from redisdesk.app.services.workspace_session import WorkspaceSession, display_bytes
+from redisdesk.app.ui.host_key_prompt import handle_host_key_error
+from redisdesk.infra.known_hosts import HostKeyMismatchError, UnknownHostKeyError
 from redisdesk.app.ui.dialogs import ConfirmRiskDialog
 from redisdesk.app.ui.i18n import env_label, protection_label, format_ttl, key_type_label
 from redisdesk.app.ui.icons import make_icon, icon_size
@@ -497,7 +499,8 @@ class KeyDetail(QWidget):
             actions.addWidget(widget)
         self.hash_add = QPushButton('新增字段')
         self.hash_del = QPushButton('删除选中字段')
-        for widget in (self.hash_add, self.hash_del):
+        self.hash_edit = QPushButton('编辑选中行的值')
+        for widget in (self.hash_add, self.hash_del, self.hash_edit):
             widget.setObjectName('tool')
             widget.setCursor(Qt.CursorShape.PointingHandCursor)
             widget.hide()
@@ -512,7 +515,7 @@ class KeyDetail(QWidget):
         self.views = QStackedWidget()
         self.views.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.string_view = StringViewer()
-        self.hash_view = FieldTableViewer(['字段', '值'], '该哈希的字段将按页显示。')
+        self.hash_view = FieldTableViewer(['字段', '值'], '该哈希的字段将按页显示。', action_label='编辑')
         self.list_view = FieldTableViewer(['索引', '值'], '列表元素按页显示。')
         self.set_view = FieldTableViewer(['成员'], '集合成员按页显示。')
         self.zset_view = FieldTableViewer(['成员', '分数'], '有序集合成员按页显示。')
@@ -539,11 +542,16 @@ class KeyDetail(QWidget):
         self.delete_btn.clicked.connect(self.delete_key)
         self.hash_add.clicked.connect(self.add_hash_field)
         self.hash_del.clicked.connect(self.delete_hash_field)
+        self.hash_edit.clicked.connect(self.edit_hash_field)
+        self.hash_view.row_action_requested.connect(self.edit_hash_field)
+        self.hash_view.table.itemSelectionChanged.connect(self._sync_hash_actions)
+        self.hash_view.table.doubleClicked.connect(lambda index: self.edit_hash_field(index.row()))
         self.string_more.clicked.connect(self.next_value)
         self.string_view.more.clicked.connect(self.next_value)
         for view in (self.hash_view, self.list_view, self.set_view, self.zset_view, self.stream_view):
             view.next.clicked.connect(self.next_value)
             view.prev.clicked.connect(self.prev_value)
+        self._pending_hash_field = None
         self.set_ready(False)
         self.show_empty('请选择键')
 
@@ -576,19 +584,19 @@ class KeyDetail(QWidget):
         self.value_generation += 1
         self.load_value(key, 0, None, replace=True)
 
-    def load_value(self, key, token, kind, *, replace=False):
+    def load_value(self, key, token, kind, *, replace=False, select_hash_field=None):
         generation = self.value_generation
         self.value_more.setEnabled(False)
         self.io.submit(
             lambda runtime: runtime.read_value(key, token, kind),
-            lambda result: self.render_value(result, replace=replace) if generation == self.value_generation else None,
+            lambda result: self.render_value(result, replace=replace, select_hash_field=select_hash_field) if generation == self.value_generation else None,
             lambda exc: self._failed(error_text(exc)) if generation == self.value_generation else None,
         )
 
     def _failed(self, message):
         self.show_empty('读取失败：' + message)
 
-    def render_value(self, result, *, replace=False):
+    def render_value(self, result, *, replace=False, select_hash_field=None):
         if replace:
             self.history = [result]
         else:
@@ -605,10 +613,11 @@ class KeyDetail(QWidget):
         total = result['total']
         self.size_label.setText('' if total is None else (f'{total} 字节' if kind == 'string' else f'{total} 项'))
         writable = can_quote(result['key'])
-        for widget in (self.ttl_btn, self.rename_btn, self.delete_btn, self.hash_add, self.hash_del):
+        for widget in (self.ttl_btn, self.rename_btn, self.delete_btn, self.hash_add, self.hash_del, self.hash_edit):
             widget.setEnabled(writable and self.ready)
         self.hash_add.setVisible(kind == 'hash')
         self.hash_del.setVisible(kind == 'hash')
+        self.hash_edit.setVisible(kind == 'hash')
         self.ttl_btn.setToolTip('' if writable else '二进制键请通过控制台操作')
         index = {'string': 0, 'hash': 1, 'list': 2, 'set': 3, 'zset': 4, 'stream': 5}.get(kind, 0)
         self.views.setCurrentIndex(index)
@@ -636,6 +645,9 @@ class KeyDetail(QWidget):
             self.zset_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index)
         else:
             self.stream_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index)
+        if kind == 'hash':
+            self._restore_hash_selection(select_hash_field)
+        self._sync_hash_actions()
         # Collection paging lives on the table viewer; strings use a compact toolbar button.
         self.value_more.hide()
         self.value_prev.hide()
@@ -655,9 +667,11 @@ class KeyDetail(QWidget):
             self.history.pop()
             self.render_value(self.history.pop(), replace=False)
 
-    def refresh(self):
+    def refresh(self, select_hash_field=None):
         if self.current_key:
-            self.open_key(self.current_key)
+            self.value_generation += 1
+            self.history = []
+            self.load_value(self.current_key, 0, None, replace=True, select_hash_field=select_hash_field)
 
     def copy_key(self):
         if self.current_key is None:
@@ -708,6 +722,76 @@ class KeyDetail(QWidget):
         if item is None:
             return
         self.request_command.emit(f'HDEL {quote_command([self.current_key])} {quote_command([item.text()])}')
+
+    def _hash_field_at(self, row=None):
+        table = self.hash_view.table
+        if row is None:
+            row = table.currentRow()
+        elif 0 <= row < table.rowCount():
+            table.selectRow(row)
+            row = table.currentRow()
+        item = table.item(row, 0) if row is not None and row >= 0 else None
+        return None if item is None else item.text()
+
+    def _hash_displayed_value(self, row=None):
+        table = self.hash_view.table
+        if row is None:
+            row = table.currentRow()
+        item = table.item(row, 1) if row is not None and row >= 0 else None
+        return '' if item is None else item.text()
+
+    def _sync_hash_actions(self):
+        writable = bool(
+            self.ready
+            and self.current_key
+            and can_quote(self.current_key)
+            and self.last_value
+            and self.last_value['kind'] == 'hash'
+        )
+        selected = self._hash_field_at() is not None
+        self.hash_add.setEnabled(writable)
+        self.hash_del.setEnabled(writable)
+        self.hash_edit.setEnabled(writable and selected)
+        if hasattr(self.hash_view, 'action_label') and self.hash_view.action_label:
+            for row in range(self.hash_view.table.rowCount()):
+                host = self.hash_view.table.cellWidget(row, self.hash_view.table.columnCount() - 1)
+                if host is not None:
+                    host.setEnabled(writable)
+
+    def _restore_hash_selection(self, field):
+        if not field:
+            return
+        table = self.hash_view.table
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            if item is not None and item.text() == field:
+                table.setCurrentCell(row, 0)
+                table.setCurrentItem(item)
+                table.selectRow(row)
+                table.scrollToItem(item)
+                return
+
+    def edit_hash_field(self, row=None):
+        if not self.current_key or not can_quote(self.current_key) or not self.last_value or self.last_value['kind'] != 'hash':
+            return
+        if isinstance(row, bool):
+            row = None
+        field = self._hash_field_at(row)
+        if field is None:
+            return
+        displayed = self._hash_displayed_value()
+        masked = '已遮罩' in displayed
+        prompt = '字段「' + field + '」的新值'
+        if masked:
+            prompt += '（当前值已遮罩，不会回填遮罩文本；输入内容将作为新值写入）'
+        initial = '' if masked else displayed
+        value, ok = QInputDialog.getMultiLineText(self, '编辑选中行的值', prompt, initial)
+        if not ok:
+            return
+        self._pending_hash_field = field
+        self.request_command.emit(
+            f'HSET {quote_command([self.current_key])} {quote_command([field])} {quote_command([value])}'
+        )
 
 
 class WorkspaceConsole(QWidget):
@@ -769,12 +853,13 @@ class WorkspaceConsole(QWidget):
         self.output.appendPlainText(text)
         self.output.document().setMaximumBlockCount(1000)
 
-    def execute(self, raw=None):
+    def execute(self, raw=None, *, on_success=None):
         if raw is None or isinstance(raw, bool):
             raw = self.input.toPlainText().strip()
         if not raw or not self.ready or self.busy:
             return
         self.busy = True
+        self._on_success = on_success
         self.run.setEnabled(False)
         def prepare(runtime):
             return runtime.prepare_console(self.console, raw, preview=True)
@@ -799,6 +884,7 @@ class WorkspaceConsole(QWidget):
             )
             if not dlg.exec():
                 self.append('已取消，命令未发送。')
+                self._on_success = None
                 self._settled()
                 return
             confirmed = True
@@ -810,10 +896,15 @@ class WorkspaceConsole(QWidget):
         rows = '\n'.join(' | '.join(row) for row in result.rows)
         tone = '成功' if result.ok else '失败'
         self.append(f'{tone}  [{result.argv_name}  {result.duration_ms} ms]\n' + (rows[:65536] or '(空结果)'))
+        callback = getattr(self, '_on_success', None)
+        self._on_success = None
         self._settled()
+        if result.ok and callback:
+            callback(result)
 
     def _error(self, exc):
         self.append('失败 / 未执行成功：' + error_text(exc))
+        self._on_success = None
         self._settled()
 
     def _settled(self):
@@ -976,9 +1067,16 @@ class ConnectionWorkspace(QWidget):
             widget.deleteLater()
 
     def run_command(self, raw: str):
-        self.show_console()
-        self.console.input.setPlainText(raw)
-        self.console.execute(raw)
+        # Workspace actions keep the key view visible; confirmation still uses the existing console write path.
+        self.console.execute(raw, on_success=self._after_detail_write)
+
+    def _after_detail_write(self, result):
+        if not result.ok or not self.detail.current_key:
+            return
+        field = getattr(self.detail, '_pending_hash_field', None)
+        self.detail._pending_hash_field = None
+        self.detail.refresh(select_hash_field=field)
+        self.tabs.setCurrentWidget(self.detail)
 
     def _mark_h_split_adjusted(self, *_args):
         self._user_adjusted_h = True
@@ -1057,6 +1155,18 @@ class ConnectionWorkspace(QWidget):
 
     def _failed(self, exc):
         self.state = 'disconnected'
+        if isinstance(exc, UnknownHostKeyError) and handle_host_key_error(
+            self,
+            exc,
+            service=self.service,
+            session=self.session,
+            profile=self.profile,
+        ):
+            self.start_connect()
+            return
+        if isinstance(exc, HostKeyMismatchError):
+            from redisdesk.app.ui.host_key_prompt import notify_host_key_mismatch
+            notify_host_key_mismatch(self, exc)
         self.connect_btn.setEnabled(True)
         self.connect_btn.setText('重试')
         self.disconnect_btn.setEnabled(False)

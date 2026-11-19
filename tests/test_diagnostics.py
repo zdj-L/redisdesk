@@ -18,7 +18,8 @@ from PySide6.QtWidgets import QApplication, QStyleFactory
 
 from redisdesk.app.services.connection_service import ConnectionService
 from redisdesk.app.ui.pages.diagnostics import DiagnosticsPage
-from redisdesk.app.ui.diagnostics_metrics import CARD_CLIENTS, CARD_KEYSPACE, CARD_MEMORY, CARD_PERSIST, CARD_REPLICATION, CARD_SERVER, CARD_STATS, DASH, SECTION_ORDER, format_save_time
+from redisdesk.app.ui.diagnostics_metrics import CARD_CLIENTS, CARD_KEYSPACE, CARD_MEMORY, CARD_PERSIST, CARD_REPLICATION, CARD_SERVER, CARD_STATS, DASH, PAGE_SECTION_ORDER, SECTION_CLIENT_LIST, SECTION_ORDER, SECTION_SLOWLOG, format_save_time
+from redisdesk.app.services.diag_service import CLIENT_SHOW_MAX, SLOWLOG_FETCH_COUNT, SLOWLOG_SHOW_ROWS, DiagnosticLists
 from redisdesk.app.ui.theme import apply_theme
 from redisdesk.core.authz import StaticGrantResolver
 from redisdesk.core.model import Endpoint
@@ -149,7 +150,12 @@ def test_diagnostics_fetches_live_info_and_tables_fit(qapp, tmp_store, audit):
         assert [ks.item(i, 0).text() for i in range(ks.rowCount())] == ["DB 0", "DB 2"]
         assert "14 \u4e2a\u952e" in ks.item(0, 1).text()
         assert "3 \u4e2a\u952e" in ks.item(1, 1).text() and "1 \u4e2a\u5e26\u8fc7\u671f" in ks.item(1, 1).text()
-        assert set(page.sections) == {CARD_SERVER, CARD_MEMORY, CARD_STATS, CARD_CLIENTS, CARD_PERSIST, CARD_REPLICATION, CARD_KEYSPACE}
+        assert list(page.sections) == list(PAGE_SECTION_ORDER)
+        assert set(page.cards) == set(SECTION_ORDER)
+        assert page.list_tables[SECTION_SLOWLOG].rowCount() == 0
+        assert page.list_tables[SECTION_CLIENT_LIST].rowCount() == 0
+        assert "无法拉取" in page.slowlog_section.note.text() or "NOPERM" in page.slowlog_section.note.text()
+        assert "无法拉取" in page.client_list_section.note.text() or "unknown command" in page.client_list_section.note.text()
         assert "INFO" in page.status.text()
         assert page.status.wordWrap() is False
         assert page.status.width() >= 240
@@ -264,7 +270,7 @@ def _assert_sections_fit(page) -> None:
 
 def _assert_single_column_flow(rects: dict, *, max_gap: int = 28) -> None:
     """Sections stack downward with a tight gap and no hole beside a short block."""
-    order = [title for title in SECTION_ORDER if title in rects]
+    order = [title for title in PAGE_SECTION_ORDER if title in rects]
     assert order, "no sections"
     lefts = [rects[title].left() for title in order]
     widths = [rects[title].width() for title in order]
@@ -364,7 +370,7 @@ def test_diagnostics_sections_layout_in_main_window(qapp, tmp_store, audit):
             QApplication.processEvents()
             page._sync_stack_height()
             QApplication.processEvents()
-        last = page.sections[CARD_KEYSPACE]
+        last = page.sections[SECTION_CLIENT_LIST]
         viewport = _global_rect(page.grid_scroll.viewport())
         lr = _global_rect(last)
         # After scrolling to the end, the last section's bottom is in the viewport and rows are unclipped.
@@ -425,4 +431,239 @@ def test_capture_diagnostics_info(qapp, tmp_store, audit):
             path = artifacts / f"{name}{suffix}.png"
             assert window.grab().save(str(path), "PNG")
             assert (window.width(), window.height()) == size
+        window.close()
+
+
+
+def resp_value(value) -> bytes:
+    if isinstance(value, bool):
+        raise TypeError("bool")
+    if isinstance(value, int):
+        return b":" + str(value).encode() + b"\r\n"
+    if isinstance(value, (list, tuple)):
+        return b"*" + str(len(value)).encode() + b"\r\n" + b"".join(resp_value(item) for item in value)
+    if isinstance(value, str):
+        value = value.encode()
+    return b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
+
+
+def _client_line(idx: int) -> str:
+    return "id={0} addr=127.0.0.1:{1} name=c{0} db=0 idle=2 flags=N sub=0 qbuf=0 omem=0 cmd=ping".format(idx, 2000 + idx)
+
+
+def _slowlog_entry(log_id: int, us: int = 1500):
+    return [log_id, 1700000000, us, ["GET", "k{0}".format(log_id)]]
+
+
+class RecordingHandler(socketserver.StreamRequestHandler):
+    """Configurable isolated RESP: supports INFO plus capped diagnostic reads."""
+
+    info_text = INFO_TEXT
+    slowlog_len = 0
+    slowlog_entries = []
+    client_lines = []
+    slower_than = "10000"
+    deny_slowlog = False
+    deny_clients = False
+    deny_config = False
+
+    def handle(self):
+        record = getattr(self.server, "commands", None)
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                return
+            if not line.startswith(b"*"):
+                continue
+            n = int(line[1:])
+            parts = []
+            for _ in range(n):
+                size = int(self.rfile.readline()[1:])
+                parts.append(self.rfile.read(size))
+                self.rfile.read(2)
+            if record is not None:
+                record.append([p.decode("utf-8", errors="replace") for p in parts])
+            cmd = parts[0].upper()
+            sub = parts[1].upper() if len(parts) > 1 else b""
+            if cmd in {b"SELECT", b"AUTH"}:
+                self.wfile.write(b"+OK\r\n")
+            elif cmd == b"PING":
+                self.wfile.write(b"+PONG\r\n")
+            elif cmd == b"INFO":
+                self.wfile.write(bulk(self.info_text))
+            elif cmd == b"CLIENT" and sub in {b"SETNAME", b"SETINFO"}:
+                self.wfile.write(b"+OK\r\n")
+            elif cmd == b"CLIENT" and sub == b"LIST":
+                if self.deny_clients:
+                    self.wfile.write(b"-ERR unknown command CLIENT\r\n")
+                else:
+                    self.wfile.write(bulk("\n".join(self.client_lines)))
+            elif cmd == b"CLIENT" and sub == b"KILL":
+                self.wfile.write(b"-ERR client kill is not offered on diagnostics\r\n")
+            elif cmd == b"SLOWLOG" and sub == b"RESET":
+                self.wfile.write(b"-ERR slowlog reset is not offered on diagnostics\r\n")
+            elif cmd == b"SLOWLOG" and sub == b"LEN":
+                if self.deny_slowlog:
+                    self.wfile.write(b"-NOPERM command denied\r\n")
+                else:
+                    self.wfile.write(resp_value(int(self.slowlog_len)))
+            elif cmd == b"SLOWLOG" and sub == b"GET":
+                if self.deny_slowlog:
+                    self.wfile.write(b"-NOPERM command denied\r\n")
+                else:
+                    count = int(parts[2]) if len(parts) > 2 else SLOWLOG_FETCH_COUNT
+                    self.wfile.write(resp_value(list(self.slowlog_entries[:count])))
+            elif cmd == b"CONFIG" and sub == b"GET":
+                if self.deny_config:
+                    self.wfile.write(b"-NOPERM command denied\r\n")
+                else:
+                    self.wfile.write(resp_value(["slowlog-log-slower-than", self.slower_than]))
+            else:
+                self.wfile.write(b"-ERR unknown command\r\n")
+            self.wfile.flush()
+
+
+@contextmanager
+def diag_server(**overrides):
+    class BoundHandler(RecordingHandler):
+        pass
+
+    for key, value in overrides.items():
+        setattr(BoundHandler, key, value)
+    with Server(("127.0.0.1", 0), BoundHandler) as server:
+        server.commands = []
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield server
+        finally:
+            server.shutdown()
+            thread.join(timeout=3)
+
+
+def _open_page(tmp_store, audit, server):
+    profile = _profile_on(server.server_address[1])
+    grants = StaticGrantResolver({("c1", "admin")})
+    service = ConnectionService(tmp_store, audit, grants)
+    session = make_session()
+    service.save(session, profile)
+    page = DiagnosticsPage(service)
+    page.resize(1280, 800)
+    page.show()
+    QApplication.processEvents()
+    page.set_context(session, profile)
+    return page
+
+
+def test_diagnostics_renders_slowlog_and_clients(qapp, tmp_store, audit):
+    entries = [_slowlog_entry(1, 350), _slowlog_entry(2, 2500)]
+    clients = [_client_line(1), _client_line(2), "id=3 addr=10.0.0.3:8 name= db=1 idle=9 flags=N cmd=get"]
+    with diag_server(slowlog_len=2, slowlog_entries=entries, client_lines=clients) as server:
+        page = _open_page(tmp_store, audit, server)
+        table = page.list_tables[SECTION_SLOWLOG]
+        assert pump_until(lambda: table.rowCount() == 2)
+        assert table.item(0, 0).text() == "1"
+        assert table.item(0, 1).text() == format_save_time("1700000000")
+        assert "\u00b5s" in table.item(0, 2).text() or "350" in table.item(0, 2).text()
+        assert "GET" in table.item(0, 3).text()
+        clients_table = page.list_tables[SECTION_CLIENT_LIST]
+        assert clients_table.rowCount() == 3
+        assert clients_table.item(0, 1).text() == "127.0.0.1:2001"
+        assert clients_table.item(2, 2).text() == DASH
+        assert clients_table.item(2, 3).text() == "1"
+        assert "2" in page.slowlog_section.note.text()
+        assert "3" in page.client_list_section.note.text()
+        assert "INFO" in page.status.text()
+        assert "\u672a\u80fd" not in page.status.text()
+        issued = [" ".join(cmd).upper() for cmd in server.commands]
+        assert any(item.startswith("SLOWLOG GET") and item.endswith(str(SLOWLOG_FETCH_COUNT)) for item in issued)
+        assert any(item == "CLIENT LIST" or item.startswith("CLIENT LIST") for item in issued)
+        assert all("SLOWLOG RESET" not in item and "CLIENT KILL" not in item for item in issued)
+        page._sync_stack_height()
+        QApplication.processEvents()
+        _assert_sections_fit(page)
+        page.close()
+
+
+def test_diagnostics_lists_empty_and_error_states(qapp, tmp_store, audit):
+    with diag_server(slowlog_len=0, slowlog_entries=[], client_lines=[], slower_than="-1") as server:
+        page = _open_page(tmp_store, audit, server)
+        assert pump_until(lambda: page.tables[CARD_SERVER].item(0, 1) is not None and page.tables[CARD_SERVER].item(0, 1).text() == "7.2.0")
+        assert page.list_tables[SECTION_SLOWLOG].rowCount() == 0
+        assert page.list_tables[SECTION_CLIENT_LIST].rowCount() == 0
+        assert "\u672a\u5f00\u542f" in page.slowlog_section.note.text() or "\u6682\u65e0" in page.slowlog_section.note.text()
+        assert "\u6682\u65e0" in page.client_list_section.note.text()
+        page.close()
+
+    with diag_server(deny_slowlog=True, deny_clients=True, deny_config=True) as server:
+        page = _open_page(tmp_store, audit, server)
+        assert pump_until(lambda: page.tables[CARD_SERVER].item(0, 1) is not None and page.tables[CARD_SERVER].item(0, 1).text() == "7.2.0")
+        assert page.list_tables[SECTION_SLOWLOG].rowCount() == 0
+        assert page.list_tables[SECTION_CLIENT_LIST].rowCount() == 0
+        assert "\u65e0\u6cd5\u62c9\u53d6" in page.slowlog_section.note.text()
+        assert "\u65e0\u6cd5\u62c9\u53d6" in page.client_list_section.note.text()
+        assert "INFO" in page.status.text()
+        page.close()
+
+
+def test_diagnostics_respects_slowlog_and_client_limits(qapp, tmp_store, audit):
+    entries = [_slowlog_entry(i) for i in range(1, 201)]
+    clients = [_client_line(i) for i in range(1, 3001)]
+    with diag_server(slowlog_len=200, slowlog_entries=entries, client_lines=clients) as server:
+        page = _open_page(tmp_store, audit, server)
+        table = page.list_tables[SECTION_SLOWLOG]
+        assert pump_until(lambda: table.rowCount() == SLOWLOG_SHOW_ROWS)
+        assert table.item(0, 0).text() == "1"
+        assert table.item(SLOWLOG_SHOW_ROWS - 1, 0).text() == str(SLOWLOG_SHOW_ROWS)
+        clients_table = page.list_tables[SECTION_CLIENT_LIST]
+        assert clients_table.rowCount() == CLIENT_SHOW_MAX
+        assert "\u4e0a\u9650" in page.slowlog_section.note.text()
+        assert "\u622a\u65ad" in page.client_list_section.note.text()
+        issued = [" ".join(cmd).upper() for cmd in server.commands]
+        get_cmds = [item for item in issued if item.startswith("SLOWLOG GET")]
+        assert get_cmds, issued
+        assert all(item.endswith(str(SLOWLOG_FETCH_COUNT)) for item in get_cmds)
+        # The mock only returns min(requested, 200); service must not ask for 200.
+        assert all("200" not in item.split()[-1:] or item.endswith(str(SLOWLOG_FETCH_COUNT)) for item in get_cmds)
+        vbar = clients_table.verticalScrollBar()
+        assert vbar.maximum() > 0
+        # Slowlog follows content: no inner scrollbar, last row unclipped.
+        sbar = table.verticalScrollBar()
+        assert (not sbar.isVisible()) or sbar.maximum() == 0
+        last = table.rowCount() - 1
+        last_rect = table.visualRect(table.model().index(last, 0))
+        assert last_rect.bottom() <= table.viewport().height()
+        section = page.sections[SECTION_SLOWLOG]
+        mapped = table.viewport().mapTo(section, last_rect.bottomRight())
+        assert mapped.y() <= section.height() - section.contentsMargins().bottom() + 1
+        page._sync_stack_height()
+        QApplication.processEvents()
+        _assert_sections_fit(page)
+        page.close()
+
+
+def test_diagnostics_lists_layout_in_main_window(qapp, tmp_store, audit):
+    entries = [_slowlog_entry(i) for i in range(1, 8)]
+    clients = [_client_line(i) for i in range(1, 12)]
+    with diag_server(slowlog_len=7, slowlog_entries=entries, client_lines=clients) as server:
+        window = _open_diagnostics_window(tmp_store, audit, server)
+        page = window.diag_page
+        assert pump_until(lambda: page.list_tables[SECTION_SLOWLOG].rowCount() == 7)
+        _size_main_window(window, (1280, 800))
+        _assert_diag_sections_in_main_window(window, first_sections_visible=True)
+        _size_main_window(window, (1024, 544))
+        _assert_diag_sections_in_main_window(window, first_sections_visible=False)
+        bar = page.grid_scroll.verticalScrollBar()
+        if bar.maximum() > 0:
+            bar.setValue(bar.maximum())
+            QApplication.processEvents()
+            page._sync_stack_height()
+            QApplication.processEvents()
+        last = page.sections[SECTION_CLIENT_LIST]
+        viewport = _global_rect(page.grid_scroll.viewport())
+        lr = _global_rect(last)
+        assert lr.bottom() <= viewport.bottom() + 2, (lr, viewport, bar.maximum(), bar.value())
+        apply_theme(qapp, "light")
+        QApplication.processEvents()
+        _assert_diag_content_follows_surface(page, "light")
         window.close()

@@ -290,7 +290,7 @@ def classify_connect_error(
         )
     if "connection" in low or "resolve" in low or "dns" in low or "name or service not known" in low:
         return AppError(ErrorCode.E01, f"连接失败{loc_suffix}", retryable=True)
-    if "readonly" in low:
+    if "readonly" in low or "read only" in low:
         return AppError(ErrorCode.E04, msg or "当前节点只读")
     if "wrongtype" in low or "oom" in low:
         return AppError(ErrorCode.E04, msg)

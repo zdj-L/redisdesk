@@ -19,11 +19,13 @@ from PySide6.QtWidgets import (
 from redisdesk.app.services.connection_service import ConnectionService
 from redisdesk.app.ui.dialog_kit import DialogSection, ScrollableDialog, StyledComboBox, configure_spinbox
 from redisdesk.app.ui.jobs import FunctionWorker
+from redisdesk.app.ui.host_key_prompt import handle_host_key_error
 from redisdesk.core.errors import AppError
+from redisdesk.infra.known_hosts import UnknownHostKeyError
 from redisdesk.core.model import SessionContext
 from redisdesk.app.ui.i18n import ENV_LABELS, PROTECTION_LABELS
-from redisdesk.core.limits import PLAINTEXT_REASON_MIN_CHARS
-from redisdesk.core.model import ConnectionProfile, Endpoint, SshConfig, TlsConfig
+from redisdesk.core.limits import PLAINTEXT_REASON_MIN_CHARS, SENTINEL_PORT
+from redisdesk.core.model import ClusterConfig, ConnectionProfile, Endpoint, SentinelConfig, SshConfig, TlsConfig
 from redisdesk.infra.store import new_id
 
 
@@ -143,6 +145,7 @@ class ConnectionEditorDialog(ScrollableDialog):
         self._service = service
         self._test_worker: FunctionWorker | None = None
         self._validation_attempted = False
+        self._retry_after_host_key = False
 
         basic = DialogSection("基本信息")
         form = _form()
@@ -156,12 +159,45 @@ class ConnectionEditorDialog(ScrollableDialog):
         self.db.setRange(0, 15)
         self.db.setValue(profile.db if profile else 0)
         self.env = _combo(ENV_LABELS, profile.env if profile else "dev")
+        existing_topology = profile.topology if profile else "direct"
+        self.topology = _combo(
+            {"direct": "单机直连", "sentinel": "哨兵", "cluster": "集群"},
+            existing_topology if existing_topology in {"direct", "sentinel", "cluster"} else "direct",
+        )
+        self.cluster_seeds = QTextEdit()
+        self.cluster_seeds.setPlaceholderText("可选。每行一个 host:port，作为额外种子节点。")
+        self.cluster_seeds.setFixedHeight(64)
+        if profile and profile.cluster and profile.cluster.seeds:
+            extras = [f"{ep.host}:{ep.port}" for ep in profile.cluster.seeds if not (ep.host == profile.host and ep.port == profile.port)]
+            if extras:
+                self.cluster_seeds.setPlainText("\n".join(extras))
+        self.master_name = QLineEdit(profile.sentinel.master_name if profile and profile.sentinel else "")
+        self.master_name.setPlaceholderText("例如 mymaster")
+        self.sentinel_extra = QTextEdit()
+        self.sentinel_extra.setPlaceholderText("可选。每行一个 host:port，作为额外哨兵。未写端口时按 26379。")
+        self.sentinel_extra.setFixedHeight(64)
+        if profile and profile.sentinel and profile.sentinel.sentinels:
+            extras = [f"{ep.host}:{ep.port}" for ep in profile.sentinel.sentinels if not (ep.host == profile.host and ep.port == profile.port)]
+            if extras:
+                self.sentinel_extra.setPlainText("\n".join(extras))
+        self._sentinel_secret_ref = profile.sentinel.sentinel_secret_ref if profile and profile.sentinel else None
+        self._saved_db = profile.db if profile and profile.topology != "cluster" else 0
+        self._saved_ports = {"direct": 6379, "sentinel": SENTINEL_PORT, "cluster": 6379}
+        if profile and profile.topology in self._saved_ports:
+            self._saved_ports[profile.topology] = profile.port
+        self._last_topology = existing_topology if existing_topology in self._saved_ports else "direct"
         form.addRow("名称", self.name)
+        form.addRow("连接模式", self.topology)
         form.addRow("主机", self.host)
         form.addRow("端口", self.port)
+        form.addRow("主节点名称", self.master_name)
+        form.addRow("其他哨兵节点", self.sentinel_extra)
         form.addRow("数据库", self.db)
+        form.addRow("其他种子节点", self.cluster_seeds)
         form.addRow("环境", self.env)
+        self._basic_form = form
         basic.body.addLayout(form)
+        self.topology.currentIndexChanged.connect(self._sync_topology_ui)
         self.body.addWidget(basic)
 
         auth = DialogSection("认证", "密码保存在本机。编辑时留空表示不修改已保存的密码。")
@@ -172,6 +208,13 @@ class ConnectionEditorDialog(ScrollableDialog):
         self.password.setPlaceholderText("不修改请留空" if profile else "可选")
         auth_form.addRow("用户名", self.username)
         auth_form.addRow("密码", self.password)
+        self.sentinel_username = QLineEdit(profile.sentinel.sentinel_username or "" if profile and profile.sentinel else "")
+        self.sentinel_password = QLineEdit()
+        self.sentinel_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sentinel_password.setPlaceholderText("不修改请留空" if self._sentinel_secret_ref else "可选，哨兵独立口令")
+        auth_form.addRow("哨兵用户名", self.sentinel_username)
+        auth_form.addRow("哨兵密码", self.sentinel_password)
+        self._auth_form = auth_form
         auth.body.addLayout(auth_form)
         self.body.addWidget(auth)
 
@@ -183,6 +226,7 @@ class ConnectionEditorDialog(ScrollableDialog):
         self._ssh_passphrase_ref = existing_ssh.passphrase_ref if existing_ssh else None
         self._ssh_password_auth_flagged = bool(existing_ssh.password_auth_flagged) if existing_ssh else False
         self._ssh_known_hosts_policy = existing_ssh.known_hosts_policy if existing_ssh else "tofu"
+        self._ssh_host_key_sha256 = existing_ssh.host_key_sha256 if existing_ssh else None
         self.ssh_block = QWidget()
         ssh_form = _form()
         self.ssh_host = QLineEdit(existing_ssh.host if existing_ssh else "")
@@ -222,6 +266,18 @@ class ConnectionEditorDialog(ScrollableDialog):
         self._ssh_key_row_index = ssh_form.rowCount() - 1
         ssh_form.addRow("私钥口令", self.ssh_passphrase)
         self._ssh_pass_row_index = ssh_form.rowCount() - 1
+        self.ssh_known_hosts_policy = _combo(
+            {
+                "tofu": "首次确认（推荐）",
+                "strict": "严格校验",
+            },
+            self._ssh_known_hosts_policy or "tofu",
+        )
+        ssh_form.addRow("主机密钥", self.ssh_known_hosts_policy)
+        policy_hint = QLabel("首次确认会展示指纹，核对后写入本应用 known_hosts；严格校验仅接受已登记的密钥。可在「设置 → SSH 已知主机」中查看或删除。密钥变更不提供「忽略并继续」。")
+        policy_hint.setObjectName("hint")
+        policy_hint.setWordWrap(True)
+        ssh_form.addRow("", policy_hint)
         self._ssh_form = ssh_form
         self.ssh_block.setLayout(ssh_form)
         ssh.body.addWidget(self.use_ssh)
@@ -265,7 +321,7 @@ class ConnectionEditorDialog(ScrollableDialog):
         security.body.addWidget(self.reason_row)
         self.body.addWidget(security)
 
-        policy = DialogSection("保护策略", "生产环境将强制只读。支持直连 TCP，以及可选的 SSH 跳板。暂不支持 Cluster / Sentinel。")
+        policy = DialogSection("保护策略", "生产环境将强制只读。单机支持 TCP 或 SSH 跳板；集群与哨兵当前支持 TCP 直连（含 TLS）。哨兵会自动发现并跟随当前主节点。")
         self.protection = _combo(PROTECTION_LABELS, profile.protection if profile else "confirm")
         pol_form = _form()
         pol_form.addRow("保护档位", self.protection)
@@ -279,6 +335,7 @@ class ConnectionEditorDialog(ScrollableDialog):
         self._on_env()
         self._sync_tls_ui(user_toggled=False)
         self._sync_ssh_ui()
+        self._sync_topology_ui()
         self.name.setFocus()
 
         self.test_button = QPushButton("测试连接")
@@ -385,6 +442,112 @@ class ConnectionEditorDialog(ScrollableDialog):
         return None
 
 
+
+    def _topology_value(self) -> str:
+        value = self.topology.currentData() or "direct"
+        if value in {"cluster", "sentinel", "direct"}:
+            return value
+        return "direct"
+
+    def _parse_cluster_seeds(self) -> list[Endpoint]:
+        extras: list[Endpoint] = []
+        text = self.cluster_seeds.toPlainText() if hasattr(self, "cluster_seeds") else ""
+        for raw in text.replace(",", "\n").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            host, port = line, 6379
+            if ":" in line.rsplit("@", 1)[-1]:
+                host, port_text = line.rsplit(":", 1)
+                try:
+                    port = int(port_text)
+                except ValueError:
+                    raise ValueError(line)
+            host = host.strip()
+            if not host:
+                continue
+            extras.append(Endpoint(host, port))
+        return extras
+
+    def _parse_host_ports(self, text: str, *, default_port: int) -> list[Endpoint]:
+        extras: list[Endpoint] = []
+        for raw in text.replace(",", "\n").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            host, port = line, default_port
+            if ":" in line.rsplit("@", 1)[-1]:
+                host, port_text = line.rsplit(":", 1)
+                try:
+                    port = int(port_text)
+                except ValueError:
+                    raise ValueError(line)
+            host = host.strip()
+            if not host:
+                continue
+            extras.append(Endpoint(host, port))
+        return extras
+
+    def _parse_sentinel_extras(self) -> list[Endpoint]:
+        text = self.sentinel_extra.toPlainText() if hasattr(self, "sentinel_extra") else ""
+        return self._parse_host_ports(text, default_port=SENTINEL_PORT)
+
+    def _sync_topology_ui(self, *_args) -> None:
+        topology = self._topology_value()
+        cluster = topology == "cluster"
+        sentinel = topology == "sentinel"
+        locked = cluster or sentinel
+        old = getattr(self, "_last_topology", topology)
+        if old != topology:
+            ports = getattr(self, "_saved_ports", {"direct": 6379, "sentinel": SENTINEL_PORT, "cluster": 6379})
+            ports[old] = int(self.port.value())
+            self.port.setValue(int(ports.get(topology, 6379)))
+            self._saved_ports = ports
+            self._last_topology = topology
+        form = getattr(self, "_basic_form", None)
+        if form is not None:
+            host_label = form.labelForField(self.host)
+            if host_label is not None:
+                if cluster:
+                    host_label.setText("种子节点")
+                elif sentinel:
+                    host_label.setText("哨兵节点")
+                else:
+                    host_label.setText("主机")
+            for widget, visible in (
+                (self.cluster_seeds, cluster),
+                (self.sentinel_extra, sentinel),
+                (self.master_name, sentinel),
+            ):
+                label = form.labelForField(widget)
+                if label is not None:
+                    label.setVisible(visible)
+                widget.setVisible(visible)
+            self.db.setEnabled(not cluster)
+            db_label = form.labelForField(self.db)
+            if db_label is not None:
+                db_label.setEnabled(not cluster)
+        auth_form = getattr(self, "_auth_form", None)
+        if auth_form is not None and hasattr(self, "sentinel_username"):
+            for widget in (self.sentinel_username, self.sentinel_password):
+                label = auth_form.labelForField(widget)
+                if label is not None:
+                    label.setVisible(sentinel)
+                widget.setVisible(sentinel)
+        if cluster:
+            if self.db.isEnabled() is False and self.db.value() != 0:
+                self._saved_db = self.db.value()
+            self.db.setValue(0)
+            if self.use_ssh.isChecked():
+                self.use_ssh.setChecked(False)
+        else:
+            if self.db.value() == 0 and getattr(self, "_saved_db", 0):
+                self.db.setValue(self._saved_db)
+        if sentinel and self.use_ssh.isChecked():
+            self.use_ssh.setChecked(False)
+        self.use_ssh.setEnabled(not locked)
+        self._sync_ssh_ui()
+
     def _sync_ssh_ui(self, *_args) -> None:
         enabled = self.use_ssh.isChecked()
         self.ssh_block.setVisible(enabled)
@@ -411,10 +574,43 @@ class ConnectionEditorDialog(ScrollableDialog):
     def ssh_password_value(self) -> str:
         return self.ssh_password.text()
 
+    def sentinel_password_value(self) -> str:
+        return self.sentinel_password.text() if hasattr(self, "sentinel_password") else ""
+
     def ssh_passphrase_value(self) -> str:
         return self.ssh_passphrase.text()
 
+    def _cluster_validation_message(self) -> str | None:
+        if self._topology_value() != "cluster":
+            return None
+        if self.use_ssh.isChecked():
+            return "当前版本的集群连接暂不支持 SSH 跳板，请改用 TCP 直连。"
+        if not self.host.text().strip():
+            return "请填写集群种子节点主机。"
+        try:
+            self._parse_cluster_seeds()
+        except ValueError as exc:
+            return f"无法解析额外种子节点：{exc}"
+        return None
+
+    def _sentinel_validation_message(self) -> str | None:
+        if self._topology_value() != "sentinel":
+            return None
+        if self.use_ssh.isChecked():
+            return "当前版本的哨兵连接暂不支持 SSH 跳板，请改用 TCP 直连。"
+        if not self.host.text().strip():
+            return "请填写哨兵节点主机。"
+        if not self.master_name.text().strip():
+            return "请填写哨兵监控的主节点名称。"
+        try:
+            self._parse_sentinel_extras()
+        except ValueError as exc:
+            return f"无法解析额外哨兵节点：{exc}"
+        return None
+
     def _ssh_validation_message(self) -> str | None:
+        if self._topology_value() in {"cluster", "sentinel"} and self.use_ssh.isChecked():
+            return "当前版本的集群与哨兵连接暂不支持 SSH 跳板，请改用 TCP 直连。" if self._topology_value() == "cluster" else "当前版本的哨兵连接暂不支持 SSH 跳板，请改用 TCP 直连。"
         if not self.use_ssh.isChecked():
             return None
         if not self.ssh_host.text().strip():
@@ -464,20 +660,48 @@ class ConnectionEditorDialog(ScrollableDialog):
                 auth_mode=auth_mode,
                 private_key_path=self.ssh_key_path.text().strip() or None,
                 passphrase_ref=self._ssh_passphrase_ref,
-                known_hosts_policy=self._ssh_known_hosts_policy or "tofu",
+                known_hosts_policy=self.ssh_known_hosts_policy.currentData() or self._ssh_known_hosts_policy or "tofu",
+                host_key_sha256=self._ssh_host_key_sha256,
                 password_auth_flagged=self._ssh_password_auth_flagged or auth_mode == "password",
                 password_ref=self._ssh_password_ref,
+            )
+        topology = self._topology_value()
+        cluster_cfg = None
+        sentinel_cfg = None
+        if topology == "cluster":
+            primary = Endpoint(self.host.text().strip(), int(self.port.value()))
+            seeds = [primary]
+            for extra in self._parse_cluster_seeds():
+                if extra.host == primary.host and extra.port == primary.port:
+                    continue
+                seeds.append(extra)
+            cluster_cfg = ClusterConfig(seeds=tuple(seeds))
+        if topology == "sentinel":
+            primary = Endpoint(self.host.text().strip(), int(self.port.value()))
+            sentinels = [primary]
+            for extra in self._parse_sentinel_extras():
+                if extra.host == primary.host and extra.port == primary.port:
+                    continue
+                sentinels.append(extra)
+            sentinel_cfg = SentinelConfig(
+                master_name=self.master_name.text().strip(),
+                sentinels=tuple(sentinels),
+                sentinel_username=self.sentinel_username.text().strip() or None,
+                sentinel_secret_ref=self._sentinel_secret_ref,
+                require_master_role=True,
             )
         return ConnectionProfile(
             id=self._id,
             name=self.name.text().strip(),
-            topology="direct",
-            transport=transport,
+            topology=topology,
+            transport="tcp" if topology in {"cluster", "sentinel"} else transport,
             endpoint=Endpoint(self.host.text().strip(), int(self.port.value())),
-            db=int(self.db.value()),
+            db=0 if topology == "cluster" else int(self.db.value()),
             username=self.username.text().strip() or None,
             tls=tls,
-            ssh=ssh,
+            ssh=None if topology in {"cluster", "sentinel"} else ssh,
+            cluster=cluster_cfg,
+            sentinel=sentinel_cfg,
             env=env,
             protection=protection,
         )
@@ -491,6 +715,19 @@ class ConnectionEditorDialog(ScrollableDialog):
         if message:
             self._refresh_validation_hints()
             self._focus_plaintext_requirement()
+            return
+        cluster_message = self._cluster_validation_message()
+        if cluster_message:
+            self.set_status("danger", cluster_message)
+            self.host.setFocus()
+            return
+        sentinel_message = self._sentinel_validation_message()
+        if sentinel_message:
+            self.set_status("danger", sentinel_message)
+            if not self.master_name.text().strip():
+                self.master_name.setFocus()
+            else:
+                self.host.setFocus()
             return
         ssh_message = self._ssh_validation_message()
         if ssh_message:
@@ -520,6 +757,19 @@ class ConnectionEditorDialog(ScrollableDialog):
             self._refresh_validation_hints()
             self._focus_plaintext_requirement()
             return
+        cluster_message = self._cluster_validation_message()
+        if cluster_message:
+            self.set_status("danger", cluster_message)
+            self.host.setFocus()
+            return
+        sentinel_message = self._sentinel_validation_message()
+        if sentinel_message:
+            self.set_status("danger", sentinel_message)
+            if not self.master_name.text().strip():
+                self.master_name.setFocus()
+            else:
+                self.host.setFocus()
+            return
         ssh_message = self._ssh_validation_message()
         if ssh_message:
             self.set_status("danger", ssh_message)
@@ -545,6 +795,7 @@ class ConnectionEditorDialog(ScrollableDialog):
                 password=password or None,
                 ssh_password=self.ssh_password_value() or None,
                 ssh_passphrase=self.ssh_passphrase_value() or None,
+                sentinel_password=self.sentinel_password_value() or None,
                 require_grant=False,
             )
 
@@ -563,9 +814,25 @@ class ConnectionEditorDialog(ScrollableDialog):
         self.set_status("ok", f"已成功连接到 {host}。{extra}".strip())
 
     def _on_draft_test_fail(self, exc) -> None:  # noqa: ANN001
+        if isinstance(exc, UnknownHostKeyError) and handle_host_key_error(
+            self,
+            exc,
+            service=self._service,
+            session=self._session,
+            profile=self.profile(),
+        ):
+            self._ssh_host_key_sha256 = exc.fingerprint
+            self._retry_after_host_key = True
+            self.set_status("info", "已登记主机密钥，正在重试连接…")
+            return
         message = exc.message if isinstance(exc, AppError) else str(exc)
+        if getattr(exc, "hint", ""):
+            message = f"{message} {exc.hint}".strip()
         self.set_status("danger", message)
 
     def _on_draft_test_settled(self) -> None:
         self.test_button.setEnabled(True)
         self.test_button.setText("测试连接")
+        if self._retry_after_host_key:
+            self._retry_after_host_key = False
+            self._test_from_form()

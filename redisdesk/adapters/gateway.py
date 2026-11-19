@@ -70,6 +70,7 @@ def open_gateway(
     ssh_password: memoryview | bytes | str | None = None,
     ssh_passphrase: memoryview | bytes | str | None = None,
     ssh_client=None,
+    sentinel_password: memoryview | bytes | str | None = None,
 ) -> RedisGateway:
     from redisdesk.adapters.topology import TopologyResolver
 
@@ -79,6 +80,7 @@ def open_gateway(
         ssh_password=ssh_password,
         ssh_passphrase=ssh_passphrase,
         ssh_client=ssh_client,
+        sentinel_password=sentinel_password,
     )
 
 

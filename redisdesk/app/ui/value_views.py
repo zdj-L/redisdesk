@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -100,8 +100,11 @@ class StringViewer(QWidget):
 
 
 class FieldTableViewer(QWidget):
-    def __init__(self, headers: list[str], empty_hint: str, parent: QWidget | None = None) -> None:
+    row_action_requested = Signal(int)
+
+    def __init__(self, headers: list[str], empty_hint: str, parent: QWidget | None = None, *, action_label: str | None = None) -> None:
         super().__init__(parent)
+        self.action_label = action_label
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
@@ -117,9 +120,16 @@ class FieldTableViewer(QWidget):
         self.filter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         bar.addWidget(self.filter, 1)
         layout.addLayout(bar)
-        self.table = DataTable(headers)
+        labels = list(headers) + (['操作'] if action_label else [])
+        self.table = DataTable(labels)
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.table.setMinimumHeight(120)
+        if action_label:
+            header = self.table.horizontalHeader()
+            header.setStretchLastSection(False)
+            value_col = 1 if len(headers) > 1 else 0
+            header.setSectionResizeMode(value_col, header.ResizeMode.Stretch)
+            header.setSectionResizeMode(len(headers), header.ResizeMode.ResizeToContents)
         layout.addWidget(self.table, 1)
         pager = QHBoxLayout()
         pager.setContentsMargins(0, 0, 0, 0)
@@ -169,10 +179,36 @@ class FieldTableViewer(QWidget):
     def _apply_filter(self) -> None:
         keyword = self.filter.text().strip().lower()
         if not keyword:
-            self.table.set_rows(self._all_rows)
+            visible = self._all_rows
+        else:
+            visible = [row for row in self._all_rows if any(keyword in cell.lower() for cell in row)]
+        self.table.set_rows(visible)
+        self._install_row_actions()
+
+    def _install_row_actions(self) -> None:
+        if not self.action_label:
             return
-        filtered = [row for row in self._all_rows if any(keyword in cell.lower() for cell in row)]
-        self.table.set_rows(filtered)
+        action_col = self.table.columnCount() - 1
+        for row in range(self.table.rowCount()):
+            button = QPushButton(self.action_label)
+            button.setObjectName('rowAction')
+            button.setFlat(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet('padding: 2px 8px 2px 0px; text-align: left; min-width: 0;')
+            button.clicked.connect(lambda *_args, visible_row=row: self._emit_row_action(visible_row))
+            host = QWidget()
+            host.setObjectName('rowActions')
+            layout = QHBoxLayout(host)
+            layout.setContentsMargins(0, 0, 8, 0)
+            layout.setSpacing(4)
+            layout.addWidget(button)
+            layout.addStretch()
+            self.table.setCellWidget(row, action_col, host)
+
+    def _emit_row_action(self, row: int) -> None:
+        if 0 <= row < self.table.rowCount():
+            self.table.selectRow(row)
+            self.row_action_requested.emit(row)
 
 
 class ValueInspector(QWidget):

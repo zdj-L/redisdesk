@@ -20,7 +20,9 @@ from redisdesk.app.ui.dialogs import ConnectionEditorDialog
 from redisdesk.app.ui.i18n import env_label, protection_label, topology_label
 from redisdesk.app.ui.jobs import FunctionWorker
 from redisdesk.app.ui.widgets import Badge, Card, DataTable, EmptyState, KeyValueTable, PageFrame, RowStatusCell
+from redisdesk.app.ui.host_key_prompt import handle_host_key_error
 from redisdesk.core.errors import AppError
+from redisdesk.infra.known_hosts import UnknownHostKeyError
 from redisdesk.core.model import ConnectionProfile, SessionContext
 
 
@@ -276,7 +278,7 @@ class ConnectionsPage(QWidget):
         dlg = ConnectionEditorDialog(parent=self, session=self.session, service=self.service)
         if dlg.exec():
             try:
-                self.service.save(self.session, dlg.profile(), password=dlg.password_value() or None, ssh_password=dlg.ssh_password_value() or None, ssh_passphrase=dlg.ssh_passphrase_value() or None)
+                self.service.save(self.session, dlg.profile(), password=dlg.password_value() or None, ssh_password=dlg.ssh_password_value() or None, ssh_passphrase=dlg.ssh_passphrase_value() or None, sentinel_password=dlg.sentinel_password_value() or None)
                 self.invalidate_workspace(dlg.profile().id)
             except AppError as exc:
                 QMessageBox.warning(self, "保存失败", exc.message)
@@ -290,7 +292,7 @@ class ConnectionsPage(QWidget):
         dlg = ConnectionEditorDialog(profile, parent=self, session=self.session, service=self.service)
         if dlg.exec():
             try:
-                self.service.save(self.session, dlg.profile(), password=dlg.password_value() or None, ssh_password=dlg.ssh_password_value() or None, ssh_passphrase=dlg.ssh_passphrase_value() or None)
+                self.service.save(self.session, dlg.profile(), password=dlg.password_value() or None, ssh_password=dlg.ssh_password_value() or None, ssh_passphrase=dlg.ssh_passphrase_value() or None, sentinel_password=dlg.sentinel_password_value() or None)
                 self.invalidate_workspace(dlg.profile().id)
             except AppError as exc:
                 QMessageBox.warning(self, "保存失败", exc.message)
@@ -347,7 +349,23 @@ class ConnectionsPage(QWidget):
 
     def _on_test_fail(self, connection_id: str, name: str, exc) -> None:  # noqa: ANN001
         self._finish_test(connection_id)
+        profile = self._profile_by_id(connection_id) or self._selected()
+        if isinstance(exc, UnknownHostKeyError) and handle_host_key_error(
+            self,
+            exc,
+            service=self.service,
+            session=self.session,
+            profile=profile,
+        ):
+            cell = self._status_cells.get(connection_id)
+            if cell is not None:
+                cell.set_busy("已登记主机密钥，正在重试…")
+            if self._selected() and self._selected().id == connection_id:
+                self._test()
+            return
         message = exc.message if isinstance(exc, AppError) else str(exc)
+        if getattr(exc, "hint", ""):
+            message = f"{message}\n{exc.hint}"
         cell = self._status_cells.get(connection_id)
         if cell is not None:
             cell.set_fail("失败：" + (message or ""), tooltip=message)

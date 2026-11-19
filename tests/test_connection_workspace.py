@@ -63,11 +63,29 @@ class Handler(socketserver.StreamRequestHandler):
                 value=getattr(self.server,'string_value',b'value')
             elif cmd==b'GETRANGE':value=getattr(self.server,'string_value',b'value')[int(parts[2]):int(parts[3])+1]
             elif cmd==b'LLEN':value=len(getattr(self.server,'list_values',[b'a',b'b']))
-            elif cmd in {b'HLEN',b'SCARD',b'ZCARD',b'XLEN'}:value=2
+            elif cmd in {b'HLEN',b'SCARD',b'ZCARD',b'XLEN'}:
+                store=getattr(self.server,'hashes',None)
+                if cmd==b'HLEN' and store is not None and parts[1] in store:
+                    value=len(store[parts[1]])
+                else:
+                    value=2
             elif cmd==b'HSCAN':
-                if getattr(self.server,'hash_pages',False):
+                store=getattr(self.server,'hashes',None)
+                if store is not None and parts[1] in store and not getattr(self.server,'hash_pages',False):
+                    flat=[]
+                    for field,val in store[parts[1]].items():
+                        flat.extend([field,val])
+                    value=[b'0',flat]
+                elif getattr(self.server,'hash_pages',False):
                     value=[b'17',sum(([('f'+str(i)).encode(),b'value'] for i in range(151)),[])] if parts[2]==b'0' else [b'0',[b'last',b'value']]
                 else:value=[b'0',[b'field',b'value']]
+            elif cmd==b'HSET':
+                if not hasattr(self.server,'hashes') or self.server.hashes is None:
+                    self.server.hashes={}
+                bucket=self.server.hashes.setdefault(parts[1],{})
+                created=0 if parts[2] in bucket else 1
+                bucket[parts[2]]=parts[3]
+                value=created
             elif cmd==b'SSCAN':value=[b'0',[b'a',b'b']]
             elif cmd==b'ZSCAN':value=[b'0',[b'a',b'1',b'b',b'2']]
             elif cmd==b'LRANGE':value=getattr(self.server,'list_values',[b'a',b'b'])[int(parts[2]):int(parts[3])+1]
@@ -721,3 +739,198 @@ def test_workspace_split_and_value_area_layout(qapp, services, wire):
 
     workspace.close_workspace()
     pump_until(lambda: workspace.io.runtime.closed)
+
+
+def _open_connected_workspace(qapp, services):
+    connections, console, session, profile = services
+    workspace = ConnectionWorkspace(connections, console, session, profile)
+    workspace.resize(1000, 700)
+    workspace.show()
+    pump_until(lambda: workspace.state == 'connected')
+    pump_until(lambda: not workspace.browser.busy and workspace.browser.tree.topLevelItemCount() > 0)
+    return workspace, console, session, profile
+
+
+def _select_key(workspace, key):
+    leaf = find_tree_leaf(workspace.browser.tree, key)
+    assert leaf is not None
+    workspace.browser.tree.setCurrentItem(leaf)
+    workspace.browser._choose(leaf, 0)
+    pump_until(lambda: workspace.detail.last_value is not None and workspace.detail.current_key == key)
+
+
+def _accept_confirm(monkeypatch, *, accepted=True):
+    from PySide6.QtWidgets import QDialog
+    monkeypatch.setattr(
+        'redisdesk.app.ui.connection_workspace.ConfirmRiskDialog.exec',
+        lambda self: QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected,
+    )
+
+
+def test_hash_edit_selected_row_value(qapp, services, wire, monkeypatch):
+    workspace, console, session, profile = _open_connected_workspace(qapp, services)
+    try:
+        _select_key(workspace, b'h')
+        assert workspace.detail.hash_edit.isVisible()
+        assert workspace.detail.hash_view.table.rowCount() >= 1
+        assert workspace.detail.hash_view.table.item(0, 0).text() == 'field'
+        assert workspace.detail.hash_view.table.item(0, 1).text() == 'value'
+        assert not workspace.detail.hash_edit.isEnabled()
+        workspace.detail.hash_view.table.selectRow(0)
+        QApplication.processEvents()
+        assert workspace.detail.hash_edit.isEnabled()
+        _accept_confirm(monkeypatch, accepted=True)
+        monkeypatch.setattr(
+            'redisdesk.app.ui.connection_workspace.QInputDialog.getMultiLineText',
+            lambda *args, **kwargs: ('updated-value', True),
+        )
+        before = len([p for p in wire.commands if p[0] == b'HSET'])
+        ttl_before = workspace.detail.ttl_badge.text()
+        kind_before = workspace.detail.type_badge.text()
+        workspace.detail.hash_edit.click()
+        pump_until(lambda: any(p[0] == b'HSET' for p in wire.commands[before:]) and not workspace.console.busy)
+        assert [b'HSET', b'h', b'field', b'updated-value'] in wire.commands
+        pump_until(lambda: workspace.detail.hash_view.table.item(0, 1) is not None and workspace.detail.hash_view.table.item(0, 1).text() == 'updated-value')
+        assert workspace.detail.last_value['kind'] == 'hash'
+        assert workspace.detail.ttl_badge.text() == ttl_before
+        assert workspace.detail.type_badge.text() == kind_before
+        assert workspace.tabs.currentWidget() is workspace.detail
+        table = workspace.detail.hash_view.table
+        selected = table.currentRow()
+        assert selected >= 0
+        assert table.item(selected, 0).text() == 'field'
+        assert table.item(selected, 1).text() == 'updated-value'
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_hash_edit_requires_selection_and_hash_type(qapp, services, wire, monkeypatch):
+    workspace, console, session, profile = _open_connected_workspace(qapp, services)
+    try:
+        _select_key(workspace, b'h')
+        prompted = []
+        monkeypatch.setattr(
+            'redisdesk.app.ui.connection_workspace.QInputDialog.getMultiLineText',
+            lambda *args, **kwargs: prompted.append('opened') or ('nope', True),
+        )
+        _accept_confirm(monkeypatch, accepted=True)
+        workspace.detail.hash_view.table.clearSelection()
+        workspace.detail.hash_view.table.setCurrentCell(-1, -1)
+        QApplication.processEvents()
+        assert not workspace.detail.hash_edit.isEnabled()
+        workspace.detail.edit_hash_field()
+        QApplication.processEvents()
+        assert prompted == []
+        assert not any(p[0] == b'HSET' for p in wire.commands)
+
+        _select_key(workspace, b'cache:a')
+        pump_until(lambda: workspace.detail.last_value is not None and workspace.detail.last_value['kind'] == 'string')
+        assert not workspace.detail.hash_edit.isVisible()
+        assert not workspace.detail.hash_add.isVisible()
+        workspace.detail.edit_hash_field()
+        QApplication.processEvents()
+        assert prompted == []
+        assert not any(p[0] == b'HSET' for p in wire.commands)
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_hash_edit_production_readonly_and_cancelled_confirm_do_not_write(qapp, services, wire, monkeypatch):
+    connections, console, session, profile = services
+    readonly = replace(profile, env='prod', protection='readonly')
+    workspace = ConnectionWorkspace(connections, console, session, readonly)
+    workspace.resize(1000, 700)
+    workspace.show()
+    try:
+        pump_until(lambda: workspace.state == 'connected')
+        pump_until(lambda: not workspace.browser.busy and workspace.browser.tree.topLevelItemCount() > 0)
+        _select_key(workspace, b'h')
+        workspace.detail.hash_view.table.selectRow(0)
+        QApplication.processEvents()
+        _accept_confirm(monkeypatch, accepted=True)
+        monkeypatch.setattr(
+            'redisdesk.app.ui.connection_workspace.QInputDialog.getMultiLineText',
+            lambda *args, **kwargs: ('should-not-write', True),
+        )
+        workspace.detail.hash_edit.click()
+        pump_until(lambda: not workspace.console.busy)
+        assert not any(p[0] == b'HSET' for p in wire.commands)
+        assert workspace.detail.hash_view.table.item(0, 1).text() == 'value'
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+    workspace = ConnectionWorkspace(connections, console, session, profile)
+    workspace.resize(1000, 700)
+    workspace.show()
+    try:
+        pump_until(lambda: workspace.state == 'connected')
+        pump_until(lambda: not workspace.browser.busy and workspace.browser.tree.topLevelItemCount() > 0)
+        _select_key(workspace, b'h')
+        workspace.detail.hash_view.table.selectRow(0)
+        QApplication.processEvents()
+        _accept_confirm(monkeypatch, accepted=False)
+        monkeypatch.setattr(
+            'redisdesk.app.ui.connection_workspace.QInputDialog.getMultiLineText',
+            lambda *args, **kwargs: ('cancelled-value', True),
+        )
+        workspace.detail.hash_edit.click()
+        pump_until(lambda: not workspace.console.busy)
+        assert not any(p[0] == b'HSET' for p in wire.commands)
+        assert '已取消' in workspace.console.output.toPlainText()
+        assert workspace.detail.hash_view.table.item(0, 1).text() == 'value'
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_hash_edit_viewer_authz_does_not_write(qapp, services, wire, monkeypatch):
+    connections, console, session, profile = services
+    connections.grants._grants.add(('c1', 'viewer'))
+    viewer = make_session('viewer')
+    workspace = ConnectionWorkspace(connections, console, viewer, profile)
+    workspace.resize(1000, 700)
+    workspace.show()
+    try:
+        pump_until(lambda: workspace.state == 'connected')
+        pump_until(lambda: not workspace.browser.busy and workspace.browser.tree.topLevelItemCount() > 0)
+        _select_key(workspace, b'h')
+        workspace.detail.hash_view.table.selectRow(0)
+        QApplication.processEvents()
+        _accept_confirm(monkeypatch, accepted=True)
+        monkeypatch.setattr(
+            'redisdesk.app.ui.connection_workspace.QInputDialog.getMultiLineText',
+            lambda *args, **kwargs: ('viewer-denied', True),
+        )
+        workspace.detail.hash_edit.click()
+        pump_until(lambda: not workspace.console.busy)
+        assert not any(p[0] == b'HSET' for p in wire.commands)
+        assert workspace.detail.hash_view.table.item(0, 1).text() == 'value'
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_hash_edit_row_action_is_discoverable(qapp, services, wire, monkeypatch):
+    workspace, console, session, profile = _open_connected_workspace(qapp, services)
+    try:
+        _select_key(workspace, b'h')
+        table = workspace.detail.hash_view.table
+        assert table.horizontalHeaderItem(2).text() == '操作'
+        host = table.cellWidget(0, 2)
+        assert host is not None
+        button = host.findChild(type(workspace.detail.hash_edit))
+        assert button is not None and button.text() == '编辑'
+        _accept_confirm(monkeypatch, accepted=True)
+        monkeypatch.setattr(
+            'redisdesk.app.ui.connection_workspace.QInputDialog.getMultiLineText',
+            lambda *args, **kwargs: ('from-row-action', True),
+        )
+        button.click()
+        pump_until(lambda: any(p == [b'HSET', b'h', b'field', b'from-row-action'] for p in wire.commands) and not workspace.console.busy)
+        pump_until(lambda: workspace.detail.hash_view.table.item(0, 1).text() == 'from-row-action')
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)

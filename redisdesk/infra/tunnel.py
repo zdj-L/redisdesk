@@ -10,6 +10,14 @@ from typing import Any, Optional
 from redisdesk.core.errors import AppError, ErrorCode
 from redisdesk.core.limits import CONNECT_TIMEOUT_S, SSH_KEEPALIVE_S
 from redisdesk.core.model import SshConfig
+from redisdesk.infra.known_hosts import (
+    HostKeyMismatchError,
+    KnownHostsStore,
+    MissingHostKeyPolicy,
+    UnknownHostKeyError,
+    assert_pinned_fingerprint,
+    mismatch_from_paramiko,
+)
 
 
 def _decode_secret(value: memoryview | bytes | bytearray | str | None) -> Optional[str]:
@@ -46,7 +54,11 @@ def classify_ssh_error(
         return AppError(ErrorCode.E07, "SSH 跳板认证失败，请检查用户名、密码或私钥。")
     if "no existing session" in low or "not a valid" in low and "key" in low or "invalid key" in low or "could not deserialize" in low:
         return AppError(ErrorCode.E07, "SSH 私钥无法使用，请检查文件路径和口令。")
-    if name in {"BadHostKeyException"} or "host key" in low or "unknown host key" in low:
+    if isinstance(exc, (UnknownHostKeyError, HostKeyMismatchError)):
+        return exc
+    if name in {"BadHostKeyException"}:
+        return mismatch_from_paramiko(exc, host=bastion_host, port=bastion_port)
+    if "host key" in low or "unknown host key" in low:
         return AppError(ErrorCode.E07, f"SSH 跳板主机密钥不受信任（{loc}）。")
     if phase == "redis" or "connect failed" in low or "administratively prohibited" in low or "channel open" in low:
         target = f"?{redis_loc}?" if redis_loc else ""
@@ -75,12 +87,14 @@ class SshTunnel:
         passphrase: memoryview | bytes | bytearray | str | None = None,
         client: Any | None = None,
         connect_timeout_s: float = CONNECT_TIMEOUT_S,
+        known_hosts_store: KnownHostsStore | None = None,
     ) -> None:
         self.config = config
         self.remote_host = remote_host
         self.remote_port = int(remote_port)
         self._password = password
         self._passphrase = passphrase
+        self._known_hosts_store = known_hosts_store
         self._external_client = client
         self._client = client
         self._connect_timeout_s = connect_timeout_s
@@ -139,10 +153,8 @@ class SshTunnel:
         client = paramiko.SSHClient()
         policy = (self.config.known_hosts_policy or "strict").lower()
         self._load_host_keys(client)
-        if policy == "tofu":
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        else:
-            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        # Never AutoAdd: unknown keys raise, and the UI may prompt only for tofu.
+        client.set_missing_host_key_policy(MissingHostKeyPolicy(port=int(self.config.port or 22), policy=policy))
 
         password = _decode_secret(self._password)
         passphrase = _decode_secret(self._passphrase)
@@ -173,6 +185,14 @@ class SshTunnel:
             client.connect(**kwargs)
             transport = client.get_transport()
             if transport is not None:
+                remote = transport.get_remote_server_key()
+                if remote is not None:
+                    assert_pinned_fingerprint(
+                        remote,
+                        self.config.host_key_sha256,
+                        host=self.config.host,
+                        port=int(self.config.port or 22),
+                    )
                 transport.set_keepalive(int(SSH_KEEPALIVE_S))
             return client
         except Exception as exc:  # noqa: BLE001
@@ -193,16 +213,8 @@ class SshTunnel:
             passphrase = None
 
     def _load_host_keys(self, client: Any) -> None:
-        try:
-            client.load_system_host_keys()
-        except Exception:
-            pass
-        known = os.path.expanduser(os.path.join("~", ".ssh", "known_hosts"))
-        if os.path.isfile(known):
-            try:
-                client.load_host_keys(known)
-            except Exception:
-                pass
+        store = getattr(self, "_known_hosts_store", None) or KnownHostsStore()
+        store.load_into_client(client)
 
     def _accept_loop(self) -> None:
         listen = self._listen

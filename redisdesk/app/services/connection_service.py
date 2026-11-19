@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional
 
 from redisdesk.adapters.acl_probe import AclProbeResult, probe
+from redisdesk.app.services.diag_service import DiagnosticsSnapshot, collect_snapshot
 from redisdesk.adapters.direct import classify_connect_error
 from redisdesk.adapters.gateway import open_gateway
 from redisdesk.adapters.tls import require_tls_or_exception
@@ -42,6 +44,7 @@ class ConnectionService:
         password: str | None = None,
         ssh_password: str | None = None,
         ssh_passphrase: str | None = None,
+        sentinel_password: str | None = None,
     ) -> ConnectionProfile:
         check_or_raise(session, Action.MANAGE_CONNECTION, grants=self.grants)
         tls = profile.tls
@@ -78,6 +81,8 @@ class ConnectionService:
                 ssh_passphrase=ssh_passphrase,
                 secret_mode=secret_mode,
             )
+        if profile.sentinel is not None and sentinel_password:
+            profile = self._store_sentinel_password(profile, sentinel_password, secret_mode=secret_mode)
         self.store.save_connection(profile, created_by=session.username, secret_mode=secret_mode)
         self._audit(session, profile, "profile_change", "allow", None)
         return profile
@@ -88,6 +93,15 @@ class ConnectionService:
         ref = SecretRef(id=sid, kind="redis_password", storage=secret_mode, cipher=cipher)  # type: ignore[arg-type]
         self.store.put_secret(ref)
         return ConnectionProfile(**{**_profile_dict(profile), "secret_ref": sid})  # type: ignore[arg-type]
+
+    def _store_sentinel_password(self, profile: ConnectionProfile, password: str, *, secret_mode: str) -> ConnectionProfile:
+        if profile.sentinel is None:
+            return profile
+        sid = profile.sentinel.sentinel_secret_ref or new_id("s")
+        cipher = protect_secret(password.encode("utf-8"), storage=secret_mode)
+        self.store.put_secret(SecretRef(id=sid, kind="sentinel_password", storage=secret_mode, cipher=cipher))  # type: ignore[arg-type]
+        sentinel = replace(profile.sentinel, sentinel_secret_ref=sid)
+        return ConnectionProfile(**{**_profile_dict(profile), "sentinel": sentinel})  # type: ignore[arg-type]
 
 
     def _store_ssh_secrets(
@@ -128,6 +142,35 @@ class ConnectionService:
             data["passphrase_ref"] = sid
         return ConnectionProfile(**{**_profile_dict(profile), "ssh": SshConfig(**data)})  # type: ignore[arg-type]
 
+    def pin_ssh_host_key(self, session: SessionContext, profile: ConnectionProfile, fingerprint: str) -> None:
+        """Persist a confirmed host-key fingerprint on a saved SSH profile."""
+        if not profile.id or not fingerprint:
+            return
+        check_or_raise(session, Action.CONNECT, profile, grants=self.grants)
+        current = self.store.get_connection(profile.id)
+        if current is None or current.ssh is None:
+            return
+        from redisdesk.core.model import SshConfig
+        from redisdesk.infra.known_hosts import normalize_fingerprint
+        pinned = normalize_fingerprint(fingerprint)
+        if current.ssh.host_key_sha256 == pinned:
+            return
+        ssh = SshConfig(**{**{
+            "host": current.ssh.host,
+            "port": current.ssh.port,
+            "username": current.ssh.username,
+            "auth_mode": current.ssh.auth_mode,
+            "private_key_path": current.ssh.private_key_path,
+            "passphrase_ref": current.ssh.passphrase_ref,
+            "known_hosts_policy": current.ssh.known_hosts_policy,
+            "local_port": current.ssh.local_port,
+            "password_auth_flagged": current.ssh.password_auth_flagged,
+            "host_key_sha256": pinned,
+            "password_ref": current.ssh.password_ref,
+        }})
+        updated = ConnectionProfile(**{**_profile_dict(current), "ssh": ssh})
+        self.store.save_connection(updated, created_by=session.username)
+
     def delete(self, session: SessionContext, connection_id: str) -> None:
         check_or_raise(session, Action.MANAGE_CONNECTION, grants=self.grants)
         profile = self.store.get_connection(connection_id)
@@ -152,6 +195,7 @@ class ConnectionService:
         ssh_passphrase: memoryview | bytes | str | None = None,
         require_grant: bool = True,
         ssh_client=None,
+        sentinel_password: memoryview | bytes | str | None = None,
     ) -> AclProbeResult:
         """测试当前表单或已保存连接。draft（未保存）时 require_grant=False，只需具备管理连接权限。"""
         if require_grant:
@@ -170,6 +214,7 @@ class ConnectionService:
                 ssh_password=ssh_password,
                 ssh_passphrase=ssh_passphrase,
                 ssh_client=ssh_client,
+                sentinel_password=sentinel_password,
             )
         except AppError:
             raise
@@ -200,6 +245,7 @@ class ConnectionService:
         ssh_password: memoryview | bytes | str | None = None,
         ssh_passphrase: memoryview | bytes | str | None = None,
         ssh_client=None,
+        sentinel_password: memoryview | bytes | str | None = None,
     ) -> AclProbeResult:
         redis_secret = _as_memoryview(password)
         return self._open_and_probe(
@@ -208,6 +254,7 @@ class ConnectionService:
             ssh_password=ssh_password,
             ssh_passphrase=ssh_passphrase,
             ssh_client=ssh_client,
+            sentinel_password=sentinel_password,
         )
 
     def _open_and_probe(
@@ -218,6 +265,7 @@ class ConnectionService:
         ssh_password: memoryview | bytes | str | None = None,
         ssh_passphrase: memoryview | bytes | str | None = None,
         ssh_client=None,
+        sentinel_password: memoryview | bytes | str | None = None,
     ) -> AclProbeResult:
         try:
             if getattr(self, "store", None) is not None:
@@ -228,6 +276,7 @@ class ConnectionService:
                     ssh_password=ssh_password,
                     ssh_passphrase=ssh_passphrase,
                     ssh_client=ssh_client,
+                    sentinel_password=sentinel_password,
                 )
             else:
                 gw = open_gateway(
@@ -236,6 +285,7 @@ class ConnectionService:
                     ssh_password=ssh_password,
                     ssh_passphrase=ssh_passphrase,
                     ssh_client=ssh_client,
+                    sentinel_password=sentinel_password,
                 )
         except AppError:
             raise
@@ -292,6 +342,39 @@ class ConnectionService:
             ) from exc
         finally:
             gw.close()
+
+
+    def fetch_diagnostics(self, session: SessionContext, profile: ConnectionProfile) -> DiagnosticsSnapshot:
+        """Read-only INFO plus best-effort slowlog and client list; list failures keep INFO."""
+        check_or_raise(session, Action.CONNECT, profile, grants=self.grants)
+        check_or_raise(session, Action.EXEC_L1, profile, grants=self.grants)
+        if self.audit.is_chain_broken() or not self.audit._writable:
+            raise AppError(ErrorCode.E13, "审计不可写，已拒绝建立连接")
+        try:
+            gw = open_gateway_with_secrets(self.store, profile)
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_connect_error(
+                exc,
+                host=profile.host,
+                port=profile.port,
+                tls_enabled=bool(profile.tls and profile.tls.enabled),
+            ) from exc
+        try:
+            return collect_snapshot(gw)
+        except AppError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_connect_error(
+                exc,
+                host=profile.host,
+                port=profile.port,
+                tls_enabled=bool(profile.tls and profile.tls.enabled),
+            ) from exc
+        finally:
+            gw.close()
+
 
     def _audit(self, session: SessionContext, profile: ConnectionProfile, event: str, decision: str, result: str | None) -> None:
         self.audit.append(
@@ -371,23 +454,55 @@ def open_gateway_with_secrets(
     ssh_password: memoryview | bytes | str | None = None,
     ssh_passphrase: memoryview | bytes | str | None = None,
     ssh_client=None,
+    sentinel_password: memoryview | bytes | str | None = None,
 ):
     """???????????????????? Redis / SSH ???"""
     redis_pw = _as_memoryview(password)
     ssh_pw = _as_memoryview(ssh_password) if not isinstance(ssh_password, memoryview) else ssh_password
     ssh_ph = _as_memoryview(ssh_passphrase) if not isinstance(ssh_passphrase, memoryview) else ssh_passphrase
+    sent_pw = _as_memoryview(sentinel_password) if not isinstance(sentinel_password, memoryview) else sentinel_password
 
     redis_ref = _lease_optional(store, profile.secret_ref) if redis_pw is None else None
     ssh_pw_ref = None
     ssh_ph_ref = None
+    sent_ref = None
     if profile.transport == "ssh" and profile.ssh is not None:
         if ssh_pw is None:
             ssh_pw_ref = _lease_optional(store, profile.ssh.password_ref)
         if ssh_ph is None:
             ssh_ph_ref = _lease_optional(store, profile.ssh.passphrase_ref)
+    if sent_pw is None and profile.sentinel is not None and profile.sentinel.sentinel_secret_ref:
+        sent_ref = _lease_optional(store, profile.sentinel.sentinel_secret_ref)
 
     # Nested leases only when stored secrets are used.
-    def _open(redis_lease, ssh_pw_lease, ssh_ph_lease):
+    def _open(redis_lease, ssh_pw_lease, ssh_ph_lease, sent_lease):
+        return open_gateway(
+            profile,
+            password=redis_lease,
+            ssh_password=ssh_pw_lease,
+            ssh_passphrase=ssh_ph_lease,
+            ssh_client=ssh_client,
+            sentinel_password=sent_lease,
+        )
+
+    def _open_with_sentinel(redis_lease, ssh_pw_lease, ssh_ph_lease):
+        if sent_ref is not None:
+            with SecretLease(sent_ref) as leased_sent:
+                return _open(redis_lease, ssh_pw_lease, ssh_ph_lease, leased_sent)
+        return _open(redis_lease, ssh_pw_lease, ssh_ph_lease, sent_pw)
+
+    if redis_ref is None and ssh_pw_ref is None and ssh_ph_ref is None:
+        return _open_with_sentinel(redis_pw, ssh_pw, ssh_ph)
+    if redis_ref is not None:
+        with SecretLease(redis_ref) as redis_lease:
+            return _open_ssh_leases(store, profile, redis_lease, ssh_pw, ssh_ph, ssh_pw_ref, ssh_ph_ref, ssh_client, _open_with_sentinel)
+    return _open_ssh_leases(store, profile, redis_pw, ssh_pw, ssh_ph, ssh_pw_ref, ssh_ph_ref, ssh_client, _open_with_sentinel)
+
+
+def _open_ssh_leases(store, profile, redis_lease, ssh_pw, ssh_ph, ssh_pw_ref, ssh_ph_ref, ssh_client, opener=None):
+    def _finish(ssh_pw_lease, ssh_ph_lease):
+        if opener is not None:
+            return opener(redis_lease, ssh_pw_lease, ssh_ph_lease)
         return open_gateway(
             profile,
             password=redis_lease,
@@ -396,48 +511,15 @@ def open_gateway_with_secrets(
             ssh_client=ssh_client,
         )
 
-    if redis_ref is None and ssh_pw_ref is None and ssh_ph_ref is None:
-        return _open(redis_pw, ssh_pw, ssh_ph)
-    if redis_ref is not None:
-        with SecretLease(redis_ref) as redis_lease:
-            return _open_ssh_leases(store, profile, redis_lease, ssh_pw, ssh_ph, ssh_pw_ref, ssh_ph_ref, ssh_client)
-    return _open_ssh_leases(store, profile, redis_pw, ssh_pw, ssh_ph, ssh_pw_ref, ssh_ph_ref, ssh_client)
-
-
-def _open_ssh_leases(store, profile, redis_lease, ssh_pw, ssh_ph, ssh_pw_ref, ssh_ph_ref, ssh_client):
     if ssh_pw_ref is not None:
         with SecretLease(ssh_pw_ref) as leased_ssh_pw:
             if ssh_ph_ref is not None:
                 with SecretLease(ssh_ph_ref) as leased_ph:
-                    return open_gateway(
-                        profile,
-                        password=redis_lease,
-                        ssh_password=leased_ssh_pw,
-                        ssh_passphrase=leased_ph,
-                        ssh_client=ssh_client,
-                    )
-            return open_gateway(
-                profile,
-                password=redis_lease,
-                ssh_password=leased_ssh_pw,
-                ssh_passphrase=ssh_ph,
-                ssh_client=ssh_client,
-            )
+                    return _finish(leased_ssh_pw, leased_ph)
+            return _finish(leased_ssh_pw, ssh_ph)
     if ssh_ph_ref is not None:
         with SecretLease(ssh_ph_ref) as leased_ph:
-            return open_gateway(
-                profile,
-                password=redis_lease,
-                ssh_password=ssh_pw,
-                ssh_passphrase=leased_ph,
-                ssh_client=ssh_client,
-            )
-    return open_gateway(
-        profile,
-        password=redis_lease,
-        ssh_password=ssh_pw,
-        ssh_passphrase=ssh_ph,
-        ssh_client=ssh_client,
-    )
+            return _finish(ssh_pw, leased_ph)
+    return _finish(ssh_pw, ssh_ph)
 
 

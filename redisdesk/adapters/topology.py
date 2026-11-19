@@ -1,6 +1,8 @@
 """根据 ConnectionProfile 选择 Gateway 实现并注入传输层。"""
 from __future__ import annotations
 
+from redisdesk.adapters.cluster import ClusterGateway
+from redisdesk.adapters.sentinel import SentinelGateway
 from redisdesk.adapters.direct import DirectGateway
 from redisdesk.adapters.gateway import GatewayNotImplemented, RedisGateway
 from redisdesk.core.errors import AppError, ErrorCode
@@ -17,11 +19,16 @@ class TopologyResolver:
         ssh_password: memoryview | bytes | str | None = None,
         ssh_passphrase: memoryview | bytes | str | None = None,
         ssh_client=None,
+        sentinel_password: memoryview | bytes | str | None = None,
     ) -> RedisGateway:
         if profile.topology == "sentinel":
-            return GatewayNotImplemented("Sentinel")
+            if profile.transport == "ssh":
+                raise AppError(ErrorCode.E07, "当前版本的哨兵连接暂不支持 SSH 跳板（发现主节点后地址会变化，需要再为新主节点建立隧道）。请改用 TCP 直连。")
+            return SentinelGateway(profile, password=password, sentinel_password=sentinel_password)
         if profile.topology == "cluster":
-            return GatewayNotImplemented("Cluster")
+            if profile.transport == "ssh":
+                raise AppError(ErrorCode.E07, "\u5f53\u524d\u7248\u672c\u7684\u96c6\u7fa4\u8fde\u63a5\u6682\u4e0d\u652f\u6301 SSH \u8df3\u677f\uff08\u91cd\u5b9a\u5411\u4f1a\u8fde\u5230\u5176\u4ed6\u8282\u70b9\uff0c\u9700\u8981\u6309\u8282\u70b9\u6620\u5c04\uff09\u3002\u8bf7\u6539\u7528 TCP \u76f4\u8fde\u3002")
+            return ClusterGateway(profile, password=password)
         if profile.topology != "direct":
             raise AppError(ErrorCode.E01, f"未知拓扑 {profile.topology}")
 

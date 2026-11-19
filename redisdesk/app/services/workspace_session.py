@@ -42,6 +42,8 @@ class WorkspaceSession:
         self.scan_started = False
         self.scan_complete = False
         self.pattern = '*'
+        self._scan_nodes = []
+        self._scan_node_index = 0
         self.dbsize = None
         self.command_log = []
         self.on_command_log = None
@@ -69,7 +71,10 @@ class WorkspaceSession:
                     raise AppError(ErrorCode.E01, "工作区已关闭。")
                 self.gateway = gw
                 try:
-                    self.dbsize = int(gw.execute(['DBSIZE'], timeout_s=5))
+                    if hasattr(gw, 'dbsize'):
+                        self.dbsize = int(gw.dbsize())
+                    else:
+                        self.dbsize = int(gw.execute(['DBSIZE'], timeout_s=5))
                     self._record_log(['DBSIZE'], True, str(self.dbsize), 0, 'session')
                 except Exception:
                     self.dbsize = None
@@ -132,6 +137,8 @@ class WorkspaceSession:
         self._db.execute('CREATE INDEX prefixes_parent ON prefixes(parent)')
         self.cursor, self.scan_started, self.scan_complete = 0, False, False
         self.pattern = pattern or '*'
+        self._scan_nodes = []
+        self._scan_node_index = 0
 
     def _note_key(self, raw: bytes):
         parts = raw.split(b':', 12)
@@ -161,7 +168,20 @@ class WorkspaceSession:
             return self.key_page()
         started = time.perf_counter()
         # COUNT is a hint, not a server-side hard limit; one request per background task.
-        cursor, keys, _ = gw.scan(None, self.cursor, match=self.pattern, count=500, key_type=None)
+        node_id = None
+        if getattr(gw, 'capabilities', None) is not None and gw.capabilities.supports_cluster:
+            if not self._scan_nodes:
+                nodes = [n for n in gw.nodes() if getattr(n, 'role', 'master') == 'master'] or list(gw.nodes())
+                self._scan_nodes = [n.node_id for n in nodes]
+                self._scan_node_index = 0
+            if not self._scan_nodes:
+                self.scan_complete = True
+                return self.key_page()
+            if self._scan_node_index >= len(self._scan_nodes):
+                self.scan_complete = True
+                return self.key_page()
+            node_id = self._scan_nodes[self._scan_node_index]
+        cursor, keys, _ = gw.scan(node_id, self.cursor, match=self.pattern, count=500, key_type=None)
         ms = int((time.perf_counter() - started) * 1000)
         added = 0
         for key in keys:
@@ -171,8 +191,16 @@ class WorkspaceSession:
                 added += 1
         self._db.commit()
         self.cursor, self.scan_started = cursor, True
-        self.scan_complete = cursor == 0
-        self._record_log(['SCAN', str(self.cursor if not self.scan_complete else 0), 'MATCH', self.pattern, 'COUNT', '500'], True, f'本批 {len(keys)}，新增 {added}', ms, 'scan')
+        if node_id and cursor == 0:
+            self._scan_node_index += 1
+            self.cursor = 0
+            self.scan_complete = self._scan_node_index >= len(self._scan_nodes)
+        else:
+            self.scan_complete = cursor == 0
+        note = f'本批 {len(keys)}，新增 {added}'
+        if node_id:
+            note += f'（节点 {self._scan_node_index}/{len(self._scan_nodes)}）'
+        self._record_log(['SCAN', str(self.cursor if not self.scan_complete else 0), 'MATCH', self.pattern, 'COUNT', '500'], True, note, ms, 'scan')
         return self.key_page()
 
     def key_page(self, page=0):

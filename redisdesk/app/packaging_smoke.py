@@ -148,8 +148,11 @@ def run(argv):
             info = service.fetch_info(session, profile)
             assert info['redis_version'] == '3.2.100'
             window.diag_page.show_info(info)
-            assert len(window.diag_page.sections) == 7
+            assert len(window.diag_page.cards) == 7
+            assert all(title in window.diag_page.sections for title in window.diag_page.cards)
+            assert len(window.diag_page.sections) == 9
             report['checks'].append('info_and_diagnostics_seven_sections')
+            report['checks'].append('diagnostics_slowlog_and_client_list_sections')
             runtime.close()
             runtime = None
             with_tunnel = SshTunnel(SshConfig(host='mock.invalid', username='smoke', auth_mode='password'),
