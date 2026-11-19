@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -14,7 +15,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from redisdesk import __version__
 from redisdesk.app.ui.theme import THEME_CHOICES, UiSettings
+from redisdesk.app.ui.update_flow import UpdateController
 from redisdesk.app.ui.dialog_kit import StyledComboBox
 from redisdesk.app.ui.jobs import FunctionWorker
 from redisdesk.app.ui.widgets import DataTable, FormSection, PageFrame
@@ -22,6 +25,7 @@ from redisdesk.core.errors import AppError
 from redisdesk.core.limits import AUDIT_RETENTION_DAYS, VALUE_PAGE_SIZE
 from redisdesk.infra.known_hosts import KnownHostEntry, KnownHostsStore
 from redisdesk.infra.paths import known_hosts_path
+from redisdesk.infra.update import PREF_AUTO_CHECK, auto_check_enabled
 
 
 class SettingsPage(QWidget):
@@ -30,6 +34,8 @@ class SettingsPage(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.ui_settings = UiSettings()
+        self.update_controller = UpdateController(self, self.ui_settings)
+        self.update_controller.set_status_handler(self._on_update_status)
         self._known_worker: FunctionWorker | None = None
         self._known_entries: list[KnownHostEntry] = []
         root = QVBoxLayout(self)
@@ -82,6 +88,41 @@ class SettingsPage(QWidget):
         security.body.addLayout(sec_form)
         self.page.add_body(security, 0)
 
+        update = FormSection(
+            "应用更新",
+            "从 GitHub Releases（zdj-L/redisdesk）检查新的 Windows 安装包。发现新版本后必须由你确认才会下载和安装；"
+            "清单提供 SHA-256 时必须校验通过，未提供摘要则拒绝安装。这是未签名的内部预览通道，不会把更新当作已签名，Windows 仍可能提示未知发布者。"
+            "更新包不含连接、密码或用户数据；安装程序也不会强制结束正在运行的 RedisDesk。",
+        )
+        upd_form = QFormLayout()
+        upd_form.setHorizontalSpacing(16)
+        upd_form.setVerticalSpacing(8)
+        self.update_version = QLabel("当前版本 " + __version__)
+        upd_form.addRow("版本", self.update_version)
+        update.body.addLayout(upd_form)
+        self.update_auto = QCheckBox("启动后自动检查更新（每 24 小时最多一次，仅已打包的应用）")
+        self.update_auto.setObjectName("updateAutoCheck")
+        self.update_auto.setChecked(auto_check_enabled(self.ui_settings))
+        self.update_auto.toggled.connect(self._on_update_auto)
+        update.body.addWidget(self.update_auto)
+        self.update_status = QLabel("可手动检查更新。若尚未发布 GitHub Release，检查结果会说明当前没有新版本。")
+        self.update_status.setObjectName("updateStatus")
+        self.update_status.setWordWrap(True)
+        self.update_status.setObjectName("hint")
+        self.update_status.setObjectName("updateStatus")
+        update.body.addWidget(self.update_status)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        self.check_update_btn = QPushButton("检查更新")
+        self.check_update_btn.setObjectName("checkUpdateButton")
+        self.check_update_btn.setObjectName("tool")
+        self.check_update_btn.setObjectName("checkUpdateButton")
+        self.check_update_btn.clicked.connect(self._check_update)
+        actions.addWidget(self.check_update_btn, 0)
+        actions.addStretch(1)
+        update.body.addLayout(actions)
+        self.page.add_body(update, 0)
+
         known = FormSection(
             "SSH \u5df2\u77e5\u4e3b\u673a",
             "\u9996\u6b21\u8fde\u63a5\u8df3\u677f\u65f6\uff0c\u82e5\u7b56\u7565\u4e3a\u300c\u9996\u6b21\u786e\u8ba4\u300d\uff0c\u4f1a\u5c55\u793a SHA-256 \u6307\u7eb9\u4f9b\u4eba\u5de5\u6838\u5bf9\uff0c\u786e\u8ba4\u540e\u5199\u5165\u4e0b\u65b9\u6587\u4ef6\u3002"
@@ -128,6 +169,19 @@ class SettingsPage(QWidget):
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
         self.reload_known_hosts()
+
+    def _on_update_auto(self, checked: bool) -> None:
+        self.ui_settings.set(PREF_AUTO_CHECK, bool(checked))
+
+    def _check_update(self) -> None:
+        if self.update_controller.busy():
+            return
+        self.check_update_btn.setEnabled(False)
+        self.update_controller.check(automatic=False)
+
+    def _on_update_status(self, text: str) -> None:
+        self.update_status.setText(text)
+        self.check_update_btn.setEnabled(not self.update_controller.busy())
 
     def _on_theme(self) -> None:
         mode = self.theme.currentData() or "light"

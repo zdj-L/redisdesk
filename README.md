@@ -75,7 +75,7 @@ python -m venv .build-venv
 
 Windows 安装包（未签名内部预览）由 `scripts/build_installer.ps1` 和 `scripts/redisdesk-installer.iss` 从上述独立运行目录生成，输出 `release/RedisDesk-1.0.0-internal-win64-setup.exe`。说明、限制和数据目录见 [内部安装包说明](docs/INTERNAL_INSTALLER.md)。
 
-这是未代码签名的内部预览，不含安装包或自动更新。另一台未安装 Python/VS 的干净 Windows 机器仍需单独验收。不要绕过 Windows 安全提示或关闭杀毒软件。便携入口默认数据目录为 `%LOCALAPPDATA%\RedisDesk-Internal\1.0.0`，与开发数据分离。
+这是未代码签名的内部预览。已打包的应用可在「设置 → 应用更新」中检查 GitHub Releases 上的新安装包（需确认后下载，并校验 SHA-256；未签名，不会当作已签名）。尚未发布首个 Release 前，检查结果会说明没有新版本。发布格式见 [内部更新说明](docs/INTERNAL_UPDATE.md)。另一台未安装 Python/VS 的干净 Windows 机器仍需单独验收。不要绕过 Windows 安全提示或关闭杀毒软件。便携入口默认数据目录为 `%LOCALAPPDATA%\RedisDesk-Internal\1.0.0`，与开发数据分离。
 
 ## 当前实现状态
 

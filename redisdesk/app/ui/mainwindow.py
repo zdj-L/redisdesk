@@ -83,6 +83,8 @@ class MainWindow(FramelessMixin, QMainWindow):
         self._launch_placed = True
         self.place_normal_on_work_area()
         QTimer.singleShot(0, self._enforce_normal_launch)
+        if getattr(self, "settings_page", None) is not None:
+            self.settings_page.update_controller.schedule_auto_check()
 
     def _enforce_normal_launch(self) -> None:
         """防止系统在 show 之后把无边框窗口拉成铺满（含任务栏）的状态。"""

@@ -2,11 +2,14 @@
 import os
 import sys
 from pathlib import Path
-from redisdesk import __version__
+
+# 1.0.x internal preview keeps the already documented isolated path across patch updates.
+INTERNAL_APPDATA_FAMILY = "1.0.0"
+
 
 def configure_portable_data():
     base = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
-    os.environ.setdefault("REDISDESK_APPDATA", str(base / "RedisDesk-Internal" / __version__))
+    os.environ.setdefault("REDISDESK_APPDATA", str(base / "RedisDesk-Internal" / INTERNAL_APPDATA_FAMILY))
 
 if __name__ == "__main__":
     configure_portable_data()

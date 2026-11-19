@@ -12,6 +12,6 @@
 
 这不会迁移或覆盖开发环境使用的 `%LOCALAPPDATA%\RedisDesk`。可用环境变量 `REDISDESK_APPDATA` 覆盖数据目录。卸载程序 **不会删除** 上述用户数据。DPAPI 保存的凭据绑定当前 Windows 用户和机器，不要在机器间复制数据目录。同一 Windows 会话中只应运行一个 RedisDesk 实例；安装或启动前请自行完全退出已在运行的程序。安装程序不会强制结束正在运行的 RedisDesk。
 
-本安装包没有自动更新。安装包与其中的 RedisDesk.exe 均未签名。尚未在未安装 Python/VS 的干净 Windows 机器上做验收。Qt/PySide6 按适用的开源 LGPLv3 条款使用；请保留安装目录中的 `LICENSES` 与第三方声明。
+安装包与其中的 RedisDesk.exe 均未签名。已安装的应用可在「设置 → 应用更新」中检查 GitHub Releases 上的新安装包；发现新版本后需确认才会下载，必须通过 SHA-256 校验，且不会把更新当作已签名。安装程序不会强制结束正在运行的 RedisDesk。在维护者发布首个 GitHub Release 之前，检查更新不会得到可安装的新版本。详见内部更新说明。尚未在未安装 Python/VS 的干净 Windows 机器上做验收。Qt/PySide6 按适用的开源 LGPLv3 条款使用；请保留安装目录中的 `LICENSES` 与第三方声明。
 
 编译安装包请使用已存在的独立运行目录 `release\RedisDesk-1.0.0-internal-win64-portable`，运行 `scripts\build_installer.ps1`。不要把开发用 `.venv` 或 `artifacts`、用户数据打进安装包。安装 Inno Setup 仅用于在本机编译；商业使用场景下，Inno Setup 作者请求（并非强制要求在预览阶段购买）购买商业许可证，详见 https://jrsoftware.org/inno-setup/purchase
