@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+    branches:
+      - publish-windows-installer
   workflow_dispatch:
 
 permissions:
@@ -46,23 +48,47 @@ jobs:
 
       - name: Packaged smoke (isolated, no real Redis or SSH)
         shell: pwsh
-        env:
-          QT_QPA_PLATFORM: offscreen
         run: |
-          $exe = "build\portable\portable_entry.dist\RedisDesk.exe"
+          $dist = "build\portable\portable_entry.dist"
+          $exe = Join-Path $dist "RedisDesk.exe"
           if (-not (Test-Path $exe)) { throw "Standalone exe missing: $exe" }
-          $plugin = Get-ChildItem -Recurse "build\portable\portable_entry.dist" -Filter "qoffscreen.dll" -ErrorAction SilentlyContinue
-          if (-not $plugin) {
-            Write-Host "qoffscreen.dll not found; using default Qt platform"
-            Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
-          }
           $report = Join-Path $env:RUNNER_TEMP "redisdesk-packaged-smoke.json"
-          & $exe --smoke-test --smoke-report $report
-          if ($LASTEXITCODE -ne 0) { throw "Packaged smoke failed: $LASTEXITCODE" }
+          Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
+          function Invoke-PackagedSmoke([string]$ReportPath) {
+            Push-Location $dist
+            try {
+              & ".\RedisDesk.exe" --smoke-test --smoke-report $ReportPath
+              return $LASTEXITCODE
+            } finally {
+              Pop-Location
+            }
+          }
+          $code = Invoke-PackagedSmoke $report
+          if (Test-Path $report) { Get-Content $report }
+          if ($code -ne 0) {
+            $plugin = Get-ChildItem -Recurse $dist -Filter "qoffscreen.dll" -ErrorAction SilentlyContinue
+            if ($plugin) {
+              Write-Host "Retrying packaged smoke with QT_QPA_PLATFORM=offscreen"
+              $env:QT_QPA_PLATFORM = "offscreen"
+              $report = Join-Path $env:RUNNER_TEMP "redisdesk-packaged-smoke-offscreen.json"
+              $code = Invoke-PackagedSmoke $report
+              if (Test-Path $report) { Get-Content $report }
+            }
+          }
+          if ($code -ne 0) { throw "Packaged smoke failed: $code" }
           if (-not (Test-Path $report)) { throw "Smoke report missing: $report" }
-          Get-Content $report
           $json = Get-Content $report -Raw | ConvertFrom-Json
           if (-not $json.ok) { throw "Packaged smoke report ok is not true" }
+
+      - name: Upload smoke report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-smoke-report
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/redisdesk-packaged-smoke.json
+            ${{ runner.temp }}/redisdesk-packaged-smoke-offscreen.json
 
       - name: Stage portable payload
         shell: pwsh
@@ -106,7 +132,7 @@ jobs:
             release/SHA256SUMS.txt
 
       - name: Publish GitHub Release
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/publish-windows-installer'
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
