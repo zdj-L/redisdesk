@@ -55,13 +55,10 @@ jobs:
           $report = Join-Path $env:RUNNER_TEMP "redisdesk-packaged-smoke.json"
           Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
           function Invoke-PackagedSmoke([string]$ReportPath) {
-            Push-Location $dist
-            try {
-              & ".\RedisDesk.exe" --smoke-test --smoke-report $ReportPath
-              return $LASTEXITCODE
-            } finally {
-              Pop-Location
-            }
+            # RedisDesk.exe is a Windows GUI binary (no console). PowerShell call
+            # operator does not wait for it, so use Start-Process -Wait.
+            $proc = Start-Process -FilePath (Join-Path $dist "RedisDesk.exe") -ArgumentList @("--smoke-test", "--smoke-report", $ReportPath) -WorkingDirectory $dist -Wait -PassThru
+            return $proc.ExitCode
           }
           $code = Invoke-PackagedSmoke $report
           if (Test-Path $report) { Get-Content $report }
