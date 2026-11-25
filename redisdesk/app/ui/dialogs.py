@@ -218,7 +218,7 @@ class ConnectionEditorDialog(ScrollableDialog):
         auth.body.addLayout(auth_form)
         self.body.addWidget(auth)
 
-        ssh = DialogSection("SSH 跳板", "从本机先 SSH 到跳板，再由跳板连接 Redis。跳板密码与私钥口令保存在本机，编辑时留空表示不修改。")
+        ssh = DialogSection("SSH 跳板", "从本机先 SSH 到跳板，再由跳板连接 Redis。集群按 CLUSTER SLOTS / MOVED / ASK 发现的节点地址在跳板上分别转发；哨兵查询与切换后的主节点同样经跳板到达。请确保跳板能访问这些地址。跳板密码与私钥口令保存在本机，编辑时留空表示不修改。")
         self.use_ssh = QCheckBox("使用 SSH 跳板")
         existing_ssh = profile.ssh if profile and profile.transport == "ssh" and profile.ssh else None
         self.use_ssh.setChecked(existing_ssh is not None)
@@ -321,7 +321,7 @@ class ConnectionEditorDialog(ScrollableDialog):
         security.body.addWidget(self.reason_row)
         self.body.addWidget(security)
 
-        policy = DialogSection("保护策略", "生产环境将强制只读。单机支持 TCP 或 SSH 跳板；集群与哨兵当前支持 TCP 直连（含 TLS）。哨兵会自动发现并跟随当前主节点。")
+        policy = DialogSection("保护策略", "生产环境将强制只读。单机、集群与哨兵均支持 TCP 直连或 SSH 跳板（含 TLS）。哨兵会自动发现并跟随当前主节点。")
         self.protection = _combo(PROTECTION_LABELS, profile.protection if profile else "confirm")
         pol_form = _form()
         pol_form.addRow("保护档位", self.protection)
@@ -496,7 +496,6 @@ class ConnectionEditorDialog(ScrollableDialog):
         topology = self._topology_value()
         cluster = topology == "cluster"
         sentinel = topology == "sentinel"
-        locked = cluster or sentinel
         old = getattr(self, "_last_topology", topology)
         if old != topology:
             ports = getattr(self, "_saved_ports", {"direct": 6379, "sentinel": SENTINEL_PORT, "cluster": 6379})
@@ -538,14 +537,10 @@ class ConnectionEditorDialog(ScrollableDialog):
             if self.db.isEnabled() is False and self.db.value() != 0:
                 self._saved_db = self.db.value()
             self.db.setValue(0)
-            if self.use_ssh.isChecked():
-                self.use_ssh.setChecked(False)
         else:
             if self.db.value() == 0 and getattr(self, "_saved_db", 0):
                 self.db.setValue(self._saved_db)
-        if sentinel and self.use_ssh.isChecked():
-            self.use_ssh.setChecked(False)
-        self.use_ssh.setEnabled(not locked)
+        self.use_ssh.setEnabled(True)
         self._sync_ssh_ui()
 
     def _sync_ssh_ui(self, *_args) -> None:
@@ -583,8 +578,6 @@ class ConnectionEditorDialog(ScrollableDialog):
     def _cluster_validation_message(self) -> str | None:
         if self._topology_value() != "cluster":
             return None
-        if self.use_ssh.isChecked():
-            return "当前版本的集群连接暂不支持 SSH 跳板，请改用 TCP 直连。"
         if not self.host.text().strip():
             return "请填写集群种子节点主机。"
         try:
@@ -596,8 +589,6 @@ class ConnectionEditorDialog(ScrollableDialog):
     def _sentinel_validation_message(self) -> str | None:
         if self._topology_value() != "sentinel":
             return None
-        if self.use_ssh.isChecked():
-            return "当前版本的哨兵连接暂不支持 SSH 跳板，请改用 TCP 直连。"
         if not self.host.text().strip():
             return "请填写哨兵节点主机。"
         if not self.master_name.text().strip():
@@ -609,8 +600,6 @@ class ConnectionEditorDialog(ScrollableDialog):
         return None
 
     def _ssh_validation_message(self) -> str | None:
-        if self._topology_value() in {"cluster", "sentinel"} and self.use_ssh.isChecked():
-            return "当前版本的集群与哨兵连接暂不支持 SSH 跳板，请改用 TCP 直连。" if self._topology_value() == "cluster" else "当前版本的哨兵连接暂不支持 SSH 跳板，请改用 TCP 直连。"
         if not self.use_ssh.isChecked():
             return None
         if not self.ssh_host.text().strip():
@@ -694,12 +683,12 @@ class ConnectionEditorDialog(ScrollableDialog):
             id=self._id,
             name=self.name.text().strip(),
             topology=topology,
-            transport="tcp" if topology in {"cluster", "sentinel"} else transport,
+            transport=transport,
             endpoint=Endpoint(self.host.text().strip(), int(self.port.value())),
             db=0 if topology == "cluster" else int(self.db.value()),
             username=self.username.text().strip() or None,
             tls=tls,
-            ssh=None if topology in {"cluster", "sentinel"} else ssh,
+            ssh=ssh,
             cluster=cluster_cfg,
             sentinel=sentinel_cfg,
             env=env,

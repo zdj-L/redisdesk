@@ -11,7 +11,7 @@ import time
 from dataclasses import replace
 from typing import Any, Callable, Optional, TypeVar
 
-from redisdesk.adapters.direct import DirectGateway, classify_connect_error
+from redisdesk.adapters.direct import DirectGateway, _get_tunnel_ssl_connection_class, classify_connect_error
 from redisdesk.adapters.gateway import Capabilities, capabilities_from_version
 from redisdesk.adapters.tls import build_ssl_context
 from redisdesk.core.errors import AppError, ErrorCode
@@ -103,12 +103,9 @@ class SentinelGateway:
         connect_timeout_s: float = CONNECT_TIMEOUT_S,
         socket_timeout_s: float = SOCKET_TIMEOUT_S,
         pool_max: int = POOL_MAX_CONNECTIONS,
+        jump=None,
     ) -> None:
-        if profile.transport == "ssh":
-            raise AppError(
-                ErrorCode.E07,
-                "\u5f53\u524d\u7248\u672c\u7684\u54e8\u5175\u8fde\u63a5\u6682\u4e0d\u652f\u6301 SSH \u8df3\u677f\uff08\u53d1\u73b0\u4e3b\u8282\u70b9\u540e\u5730\u5740\u4f1a\u53d8\u5316\uff0c\u9700\u8981\u518d\u4e3a\u65b0\u4e3b\u8282\u70b9\u5efa\u7acb\u96a7\u9053\uff09\u3002\u8bf7\u6539\u7528 TCP \u76f4\u8fde\u3002",
-            )
+        self._jump = jump
         cfg = profile.sentinel
         if cfg is None or not (cfg.master_name or "").strip():
             raise sentinel_error("\u8bf7\u586b\u5199\u54e8\u5175\u76d1\u63a7\u7684\u4e3b\u8282\u70b9\u540d\u79f0\u3002")
@@ -176,9 +173,14 @@ class SentinelGateway:
             else:
                 raw = secret.tobytes() if isinstance(secret, memoryview) else bytes(secret)
                 passwd = raw.decode("utf-8", errors="surrogateescape") if raw else None
+        logical_host, logical_port = host, int(port)
+        connect_host, connect_port = logical_host, logical_port
+        jump = getattr(self, "_jump", None)
+        if jump is not None:
+            connect_host, connect_port = jump.endpoint(logical_host, logical_port)
         kwargs: dict[str, Any] = {
-            "host": host,
-            "port": int(port),
+            "host": connect_host,
+            "port": int(connect_port),
             "db": 0,
             "username": (cfg.sentinel_username if cfg else None) or None,
             "password": passwd,
@@ -203,10 +205,13 @@ class SentinelGateway:
                     "ssl_min_version": ssl_ctx.minimum_version,
                 }
             )
+            if jump is not None:
+                kwargs["connection_class"] = _get_tunnel_ssl_connection_class()
+                kwargs["tls_server_hostname"] = logical_host
         try:
             return redis.Redis(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise classify_connect_error(exc, host=host, port=int(port), tls_enabled=bool(tls.enabled)) from exc
+            raise classify_connect_error(exc, host=logical_host, port=int(logical_port), tls_enabled=bool(tls.enabled)) from exc
         finally:
             passwd = None
 
@@ -313,9 +318,14 @@ class SentinelGateway:
             endpoint=Endpoint(host, int(port)),
             cluster=None,
         )
+        tunnel = None
+        jump = getattr(self, "_jump", None)
+        if jump is not None:
+            tunnel = jump.open(host, int(port))
         gw = DirectGateway(
             master_profile,
             password=self._password,
+            tunnel=tunnel,
             pool_max=self._pool_max,
             connect_timeout_s=self._connect_timeout_s,
             socket_timeout_s=self._socket_timeout_s,
@@ -493,5 +503,12 @@ class SentinelGateway:
         if gw is not None:
             try:
                 gw.close()
+            except Exception:
+                pass
+        jump = getattr(self, "_jump", None)
+        self._jump = None
+        if jump is not None:
+            try:
+                jump.close()
             except Exception:
                 pass

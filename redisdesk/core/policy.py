@@ -617,6 +617,12 @@ class PolicyEngine:
             "ACL": "修改 ACL 可能导致锁死或越权",
             "CLUSTER": "集群拓扑变更，极高风险",
         }
+        if getattr(profile, "topology", "") == "cluster":
+            reasons = {
+                **reasons,
+                "FLUSHALL": "将清空集群全部主节点的数据，不可恢复（不是只清空单个节点）",
+                "FLUSHDB": "将清空集群全部主节点的当前数据库，不可恢复（不是只清空单个节点）",
+            }
         alternative = "请用 SCAN" if name == "KEYS" else ""
         return RiskAssessment(
             level="L4",

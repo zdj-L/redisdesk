@@ -1,17 +1,20 @@
 """Redis Cluster gateway: slot routing, MOVED/ASK follow, per-master SCAN.
 
 Uses one redis-py standalone client per node (RESP2, inherited TLS/auth).
-This is not a thin wrapper around RedisCluster: cross-slot commands are
-rejected, SCAN is per-master, and SELECT is not used.
+This is not a thin wrapper around RedisCluster: SCAN is per-master, SELECT
+is not used, and unsplittable cross-slot commands are rejected. Splittable
+reads/writes (MGET/DEL/...) are fanned out by slot; MULTI/EXEC is only
+accepted as a same-slot pipeline and is never claimed atomic across slots.
 """
 
 from __future__ import annotations
 
 import ssl
 import time
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from redisdesk.adapters.direct import classify_connect_error
+from redisdesk.adapters.direct import _get_tunnel_ssl_connection_class, classify_connect_error
 from redisdesk.adapters.gateway import Capabilities, capabilities_from_version
 from redisdesk.adapters.tls import build_ssl_context
 from redisdesk.core.errors import AppError, ErrorCode
@@ -61,6 +64,39 @@ _SINGLE_KEY_COMMANDS = {
 
 _MULTI_KEY_ALL = {"DEL", "UNLINK", "EXISTS", "TOUCH", "MGET", "WATCH"}
 _MULTI_KEY_PAIRS = {"MSET", "MSETNX"}
+
+# Cross-slot commands we can split and recombine. MSET is applied per slot and
+# is explicitly not atomic across slots. MSETNX and set algebra cannot be split
+# without changing semantics, so they stay rejected.
+_SPLIT_SUM = {"DEL", "UNLINK", "EXISTS", "TOUCH"}
+_SPLIT_MGET = {"MGET"}
+_SPLIT_MSET = {"MSET"}
+_BROADCAST_WRITES = {"FLUSHALL", "FLUSHDB"}
+_TX_COMMANDS = {"MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH"}
+_INFO_SUM_INT = {
+    "connected_clients", "blocked_clients", "rejected_connections",
+    "total_connections_received", "used_memory", "used_memory_rss",
+    "expired_keys", "evicted_keys", "total_commands_processed",
+    "keyspace_hits", "keyspace_misses", "instantaneous_ops_per_sec",
+    "connected_slaves", "rdb_changes_since_last_save",
+}
+_INFO_MAX_INT = {"used_memory_peak", "uptime_in_seconds", "rdb_last_save_time"}
+
+
+@dataclass
+class NodeCommandResult:
+    """Result of running one command on a single cluster master."""
+
+    node_id: str
+    host: str
+    port: int
+    ok: bool
+    value: Any = None
+    error: str | None = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.host}:{int(self.port)}"
 
 
 def key_slot(key: bytes | str) -> int:
@@ -259,6 +295,83 @@ def cluster_error(message: str, *, hint: str = "") -> AppError:
     return AppError(ErrorCode.E05, message, hint=hint)
 
 
+
+def _as_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _human_mem(num: int) -> str:
+    value = float(max(0, int(num)))
+    for unit, size in (("B", 1), ("K", 1024), ("M", 1024 ** 2), ("G", 1024 ** 3), ("T", 1024 ** 4)):
+        step = size * 1024 if unit != "T" else None
+        if step is None or value < step:
+            if unit == "B":
+                return f"{int(value)}B"
+            return f"{value / size:.2f}{unit}"
+    return f"{value:.2f}T"
+
+
+def _node_label(node: NodeInfo) -> str:
+    return f"{node.host}:{int(node.port)}"
+
+
+def _merge_cluster_info(parts: list[tuple[NodeInfo, dict[str, str]]]) -> dict[str, str]:
+    if not parts:
+        return {}
+    merged: dict[str, str] = dict(parts[0][1])
+    sums: dict[str, int] = {}
+    peaks: dict[str, int] = {}
+    keyspace: dict[str, list[int]] = {}
+    for _node, data in parts:
+        for key in _INFO_SUM_INT:
+            num = _as_int(data.get(key))
+            if num is not None:
+                sums[key] = sums.get(key, 0) + num
+        for key in _INFO_MAX_INT:
+            num = _as_int(data.get(key))
+            if num is not None:
+                peaks[key] = num if key not in peaks else max(peaks[key], num)
+        for key, value in data.items():
+            if not key.lower().startswith("db") or not key[2:].isdigit():
+                continue
+            text = str(value)
+            keys = expires = 0
+            for piece in text.split(","):
+                if "=" not in piece:
+                    continue
+                name, raw = piece.split("=", 1)
+                if name.strip() == "keys":
+                    keys = _as_int(raw) or 0
+                elif name.strip() == "expires":
+                    expires = _as_int(raw) or 0
+            prev = keyspace.get(key, [0, 0])
+            keyspace[key] = [prev[0] + keys, prev[1] + expires]
+    for key, num in sums.items():
+        merged[key] = str(num)
+    for key, num in peaks.items():
+        merged[key] = str(num)
+    if "used_memory" in sums:
+        merged["used_memory_human"] = _human_mem(sums["used_memory"])
+    if "used_memory_rss" in sums:
+        merged["used_memory_rss_human"] = _human_mem(sums["used_memory_rss"])
+    if "used_memory_peak" in peaks:
+        merged["used_memory_peak_human"] = _human_mem(peaks["used_memory_peak"])
+    for key, (keys, expires) in keyspace.items():
+        merged[key] = f"keys={keys},expires={expires}"
+    versions = {data.get("redis_version", "") for _n, data in parts}
+    versions.discard("")
+    if len(versions) > 1:
+        merged["redis_version"] = parts[0][1].get("redis_version", "") + " \u7b49"
+    merged["redis_mode"] = "cluster"
+    merged["role"] = "master"
+    return merged
+
+
 class ClusterGateway:
     def __init__(
         self,
@@ -269,12 +382,9 @@ class ClusterGateway:
         socket_timeout_s: float = SOCKET_TIMEOUT_S,
         pool_max: int = POOL_MAX_CONNECTIONS,
         slot_ttl_s: float | None = None,
+        jump=None,
     ) -> None:
-        if profile.transport == "ssh":
-            raise AppError(
-                ErrorCode.E07,
-                "\u5f53\u524d\u7248\u672c\u7684\u96c6\u7fa4\u8fde\u63a5\u6682\u4e0d\u652f\u6301 SSH \u8df3\u677f\uff08\u91cd\u5b9a\u5411\u4f1a\u8fde\u5230\u5176\u4ed6\u8282\u70b9\uff0c\u9700\u8981\u6309\u8282\u70b9\u6620\u5c04\uff09\u3002\u8bf7\u6539\u7528 TCP \u76f4\u8fde\u3002",
-            )
+        self._jump = jump
         self.profile = profile
         self.capabilities: Capabilities = capabilities_from_version("0.0.0", cluster=True)
         self._password = password
@@ -327,9 +437,14 @@ class ClusterGateway:
         if password is not None:
             raw = password.tobytes() if isinstance(password, memoryview) else bytes(password)
             passwd = raw.decode("utf-8", errors="surrogateescape")
+        logical_host, logical_port = host, int(port)
+        connect_host, connect_port = logical_host, logical_port
+        jump = getattr(self, "_jump", None)
+        if jump is not None:
+            connect_host, connect_port = jump.endpoint(logical_host, logical_port)
         kwargs: dict[str, Any] = {
-            "host": host,
-            "port": int(port),
+            "host": connect_host,
+            "port": int(connect_port),
             "db": 0,
             "username": self.profile.username or None,
             "password": passwd,
@@ -354,13 +469,16 @@ class ClusterGateway:
                     "ssl_min_version": ssl_ctx.minimum_version,
                 }
             )
+            if jump is not None:
+                kwargs["connection_class"] = _get_tunnel_ssl_connection_class()
+                kwargs["tls_server_hostname"] = logical_host
         try:
             return redis.Redis(**kwargs)
         except Exception as exc:  # noqa: BLE001
             raise classify_connect_error(
                 exc,
-                host=host,
-                port=int(port),
+                host=logical_host,
+                port=int(logical_port),
                 tls_enabled=bool(tls.enabled),
             ) from exc
         finally:
@@ -506,26 +624,43 @@ class ClusterGateway:
         return time.perf_counter() - started
 
     def info(self, section: str | None = None) -> dict[str, str]:
-        master = self._any_master()
-        try:
-            raw = self._client_for(master).info(section) if section else self._client_for(master).info()
-        except Exception as exc:  # noqa: BLE001
-            raise self._map(exc, command="INFO") from exc
-        out: dict[str, str] = {}
-        if isinstance(raw, dict):
-            for key, value in raw.items():
-                out[str(key)] = value if isinstance(value, str) else str(value)
+        masters = self.masters()
+        if not masters:
+            raise cluster_error("集群没有可查询的主节点。")
+        collected: list[tuple[NodeInfo, dict[str, str]]] = []
+        errors: list[str] = []
+        for node in masters:
+            try:
+                raw = self._client_for(node).info(section) if section else self._client_for(node).info()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{_node_label(node)} {self._map(exc, command='INFO').message}")
+                continue
+            item: dict[str, str] = {}
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    item[str(key)] = value if isinstance(value, str) else str(value)
+            collected.append((node, item))
+        if not collected:
+            raise cluster_error(
+                "无法从任何主节点拉取 INFO。",
+                hint="; ".join(errors),
+            )
+        out = _merge_cluster_info(collected)
         out.setdefault("redis_mode", "cluster")
         try:
-            extra = self._client_for(master).execute_command("CLUSTER", "INFO")
-            text = _as_text(extra)
-            for line in text.splitlines():
+            extra = self._client_for(collected[0][0]).execute_command("CLUSTER", "INFO")
+            cluster_text = _as_text(extra)
+            for line in cluster_text.splitlines():
                 if ":" in line and not line.startswith("#"):
                     key, value = line.split(":", 1)
                     out.setdefault(key.strip(), value.strip())
         except Exception:
             pass
-        out["cluster_masters"] = str(len(self.masters()))
+        out["cluster_masters"] = str(len(masters))
+        out["cluster_info_ok"] = str(len(collected))
+        out["cluster_info_failed"] = str(len(errors))
+        if errors:
+            out["cluster_info_errors"] = "; ".join(errors)
         return out
 
     def masters(self) -> list[NodeInfo]:
@@ -601,18 +736,32 @@ class ClusterGateway:
 
     def execute(self, argv: list[str], *, timeout_s: float) -> Any:
         if not argv:
-            raise AppError(ErrorCode.E10, "\u7a7a\u547d\u4ee4")
+            raise AppError(ErrorCode.E10, "空命令")
         name = argv[0].upper()
+        sub = argv[1].upper() if len(argv) > 1 else ""
         if name == "SELECT":
-            raise AppError(ErrorCode.E08, "\u96c6\u7fa4\u4e0d\u652f\u6301 SELECT\uff0c\u8bf7\u4f7f\u7528 db 0\u3002")
+            raise AppError(ErrorCode.E08, "集群不支持 SELECT，请使用 db 0。")
+        if name in _TX_COMMANDS:
+            raise cluster_error(
+                "集群不支持逐条发送 MULTI/EXEC。请在同一管道中提交完整事务，且全部 key 必须位于同一槽；跨槽事务不能保证原子性。"
+            )
         if name == "DBSIZE":
             return self.dbsize()
+        if name in _BROADCAST_WRITES or (name == "SCRIPT" and sub == "FLUSH") or (name == "FUNCTION" and sub == "FLUSH"):
+            return self._broadcast_write(argv, timeout_s=timeout_s)
         keys = extract_keys(argv)
         if len(keys) > 1:
             slots = {key_slot(key) for key in keys}
             if len(slots) > 1:
+                if name in _SPLIT_SUM or name in _SPLIT_MGET or name in _SPLIT_MSET:
+                    return self._split_execute(argv, keys, timeout_s=timeout_s)
+                if name == "MSETNX":
+                    raise cluster_error(
+                        "跨槽 MSETNX 无法保证原子性，已拒绝。请按槽拆分后再试。",
+                        hint=", ".join(f"{_as_text(k)}->{key_slot(k)}" for k in keys[:8]),
+                    )
                 raise cluster_error(
-                    "\u8be5\u547d\u4ee4\u6d89\u53ca\u591a\u4e2a\u69fd\u7684 key\uff0c\u96c6\u7fa4\u4e0d\u5141\u8bb8\u5728\u4e00\u6b21\u8bf7\u6c42\u4e2d\u8de8\u69fd\u6267\u884c\u3002\u8bf7\u6539\u4e3a\u5355\u4e2a key\uff0c\u6216\u6309\u69fd\u62c6\u5206\u540e\u518d\u8bd5\u3002",
+                    "该命令要求全部 key 位于同一槽，集群无法在一次请求中跨槽执行。请改为单个 key，或按槽拆分后再试。",
                     hint=", ".join(f"{_as_text(k)}->{key_slot(k)}" for k in keys[:8]),
                 )
         target: NodeInfo | None = None
@@ -631,11 +780,240 @@ class ClusterGateway:
         return total
 
     def pipeline(self, commands: list[list[str]], *, batch: int) -> list[Any]:
-        # Non-transactional only. Each command is routed independently.
-        results: list[Any] = []
-        for argv in commands:
-            results.append(self.execute(argv, timeout_s=self._socket_timeout_s))
+        if not commands:
+            return []
+        size = max(1, int(batch or 1))
+        results: list[Any] = [None] * len(commands)
+        index = 0
+        while index < len(commands):
+            argv = commands[index]
+            name = argv[0].upper() if argv else ""
+            if name == "MULTI":
+                end = index + 1
+                while end < len(commands):
+                    other = commands[end][0].upper() if commands[end] else ""
+                    if other in {"EXEC", "DISCARD"}:
+                        break
+                    end += 1
+                if end >= len(commands):
+                    raise cluster_error("MULTI 缺少 EXEC 或 DISCARD，已拒绝执行不完整事务。")
+                block = commands[index : end + 1]
+                block_results = self._pipeline_transaction(block, timeout_s=self._socket_timeout_s)
+                for offset, value in enumerate(block_results):
+                    results[index + offset] = value
+                index = end + 1
+                continue
+            if name in {"EXEC", "DISCARD"}:
+                raise cluster_error("EXEC/DISCARD 没有对应的 MULTI，已拒绝。")
+            start = index
+            chunk: list[list[str]] = []
+            while index < len(commands):
+                head = commands[index][0].upper() if commands[index] else ""
+                if head == "MULTI":
+                    break
+                chunk.append(commands[index])
+                index += 1
+            chunk_results = self._pipeline_plain(chunk, batch=size)
+            for offset, value in enumerate(chunk_results):
+                results[start + offset] = value
         return results
+
+    def fanout_on_masters(self, argv: list[str], *, timeout_s: float, continue_on_error: bool = True) -> list[NodeCommandResult]:
+        results: list[NodeCommandResult] = []
+        for node in self.masters():
+            try:
+                value = self._send(list(argv), node=node, timeout_s=timeout_s, allow_redirect=True)
+                results.append(
+                    NodeCommandResult(node_id=node.node_id, host=node.host, port=int(node.port), ok=True, value=value)
+                )
+            except Exception as exc:  # noqa: BLE001
+                mapped = self._map(exc, command=argv[0] if argv else "")
+                message = mapped.message if isinstance(mapped, AppError) else str(exc)
+                results.append(
+                    NodeCommandResult(
+                        node_id=node.node_id,
+                        host=node.host,
+                        port=int(node.port),
+                        ok=False,
+                        error=message,
+                    )
+                )
+                if not continue_on_error:
+                    break
+        return results
+
+    def _broadcast_write(self, argv: list[str], *, timeout_s: float) -> Any:
+        name = argv[0].upper()
+        rows = self.fanout_on_masters(argv, timeout_s=timeout_s, continue_on_error=True)
+        if not rows:
+            raise cluster_error(f"{name} 没有可执行的主节点。")
+        ok = [row for row in rows if row.ok]
+        failed = [row for row in rows if not row.ok]
+        if failed and not ok:
+            hint = "; ".join(f"{row.label} ({row.error})" for row in failed)
+            raise cluster_error(f"{name} 未能在任何主节点上执行。", hint=hint)
+        if failed:
+            hint = "; ".join(f"{row.label} ({row.error})" for row in failed)
+            raise cluster_error(
+                f"{name} 已向 {len(rows)} 个主节点发出，其中 {len(failed)} 个失败，集群数据可能只被部分清空。失败节点：{hint}。"
+            )
+        first = ok[0].value
+        return first if first is not None else "OK"
+
+    def _uses_execute_path(self, argv: list[str]) -> bool:
+        if not argv:
+            return True
+        name = argv[0].upper()
+        sub = argv[1].upper() if len(argv) > 1 else ""
+        if name in {"SELECT", "DBSIZE"} or name in _TX_COMMANDS or name in _BROADCAST_WRITES:
+            return True
+        if (name == "SCRIPT" and sub == "FLUSH") or (name == "FUNCTION" and sub == "FLUSH"):
+            return True
+        keys = extract_keys(argv)
+        if len(keys) > 1 and len({key_slot(key) for key in keys}) > 1:
+            return True
+        return False
+
+    def _pipeline_plain(self, commands: list[list[str]], *, batch: int) -> list[Any]:
+        if not commands:
+            return []
+        size = max(1, int(batch or 1))
+        results: list[Any] = [None] * len(commands)
+        pending: list[int] = []
+
+        def flush_pending() -> None:
+            if not pending:
+                return
+            grouped: dict[str, list[int]] = {}
+            nodes: dict[str, NodeInfo] = {}
+            for index in pending:
+                argv = commands[index]
+                keys = extract_keys(argv)
+                node = self._master_for_slot(key_slot(keys[0])) if keys else self._any_master()
+                grouped.setdefault(node.node_id, []).append(index)
+                nodes[node.node_id] = node
+            for node_id, indexes in grouped.items():
+                client = self._client_for(nodes[node_id])
+                for start in range(0, len(indexes), size):
+                    chunk = indexes[start : start + size]
+                    pipe = client.pipeline(transaction=False)
+                    for index in chunk:
+                        pipe.execute_command(*commands[index])
+                    try:
+                        values = pipe.execute()
+                    except Exception as exc:  # noqa: BLE001
+                        head = commands[chunk[0]][0] if commands[chunk[0]] else ""
+                        raise self._map(exc, command=head) from exc
+                    seq = list(values) if isinstance(values, (list, tuple)) else [values]
+                    for offset, index in enumerate(chunk):
+                        results[index] = seq[offset] if offset < len(seq) else None
+            pending.clear()
+
+        for index, argv in enumerate(commands):
+            if self._uses_execute_path(argv):
+                flush_pending()
+                results[index] = self.execute(argv, timeout_s=self._socket_timeout_s)
+            else:
+                pending.append(index)
+        flush_pending()
+        return results
+
+    def _pipeline_transaction(self, block: list[list[str]], *, timeout_s: float) -> list[Any]:
+        closer = block[-1][0].upper() if block and block[-1] else ""
+        inner = block[1:-1] if len(block) >= 2 else []
+        keys: list[bytes] = []
+        for argv in inner:
+            keys.extend(extract_keys(argv))
+        if keys:
+            slots = {key_slot(key) for key in keys}
+            if len(slots) > 1:
+                raise cluster_error("MULTI/EXEC 不能跨槽保证原子性，已拒绝。请确保事务内全部 key 位于同一槽。")
+            node = self._master_for_slot(key_slot(keys[0]))
+        else:
+            node = self._any_master()
+        client = self._client_for(node)
+        conn = client.connection_pool.get_connection("MULTI")
+        old = getattr(conn, "socket_timeout", None)
+        sock = getattr(conn, "_sock", None)
+        try:
+            conn.socket_timeout = timeout_s
+            if sock is not None:
+                sock.settimeout(timeout_s)
+            results: list[Any] = []
+            for argv in block:
+                conn.send_command(*argv)
+                name = argv[0].upper() if argv else ""
+                if name in {"MULTI", "EXEC", "DISCARD"}:
+                    results.append(client.parse_response(conn, argv[0]))
+                else:
+                    # Do not use command-specific callbacks: they map "QUEUED" to False.
+                    raw = conn.read_response()
+                    if isinstance(raw, bytes):
+                        try:
+                            results.append(raw.decode("utf-8"))
+                        except UnicodeDecodeError:
+                            results.append(raw)
+                    else:
+                        results.append(raw)
+            return results
+        except BaseException:
+            conn.disconnect()
+            raise
+        finally:
+            conn.socket_timeout = old
+            if getattr(conn, "_sock", None) is not None:
+                conn._sock.settimeout(old)
+            client.connection_pool.release(conn)
+
+    def _split_execute(self, argv: list[str], keys: list[bytes], *, timeout_s: float) -> Any:
+        name = argv[0].upper()
+        groups: dict[int, list[int]] = {}
+        for index, key in enumerate(keys):
+            groups.setdefault(key_slot(key), []).append(index)
+        if name in _SPLIT_MGET:
+            values: list[Any] = [None] * len(keys)
+            for slot, indexes in groups.items():
+                node = self._master_for_slot(slot)
+                sub = [name] + [_as_text(keys[i]) for i in indexes]
+                try:
+                    raw = self._send(sub, node=node, timeout_s=timeout_s)
+                except Exception as exc:  # noqa: BLE001
+                    raise self._map(exc, command=name) from exc
+                seq = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+                for offset, key_index in enumerate(indexes):
+                    values[key_index] = seq[offset] if offset < len(seq) else None
+            return values
+        if name in _SPLIT_MSET:
+            pairs = list(zip(argv[1::2], argv[2::2]))
+            if len(pairs) != len(keys):
+                raise cluster_error("MSET 参数必须是 key/值成对。")
+            errors: list[str] = []
+            for slot, indexes in groups.items():
+                flat: list[str] = []
+                for i in indexes:
+                    flat.extend([str(pairs[i][0]), str(pairs[i][1])])
+                node = self._master_for_slot(slot)
+                try:
+                    self._send([name] + flat, node=node, timeout_s=timeout_s)
+                except Exception as exc:  # noqa: BLE001
+                    mapped = self._map(exc, command=name)
+                    errors.append(f"{_node_label(node)} {mapped.message}")
+            if errors:
+                raise cluster_error(
+                    "跨槽 MSET 已按槽分发，不保证原子性，且部分节点失败。",
+                    hint="; ".join(errors),
+                )
+            return "OK"
+        total = 0
+        for slot, indexes in groups.items():
+            node = self._master_for_slot(slot)
+            sub = [name] + [_as_text(keys[i]) for i in indexes]
+            try:
+                raw = self._send(sub, node=node, timeout_s=timeout_s)
+            except Exception as exc:  # noqa: BLE001
+                raise self._map(exc, command=name) from exc
+            total += int(raw or 0)
+        return total
 
     def route(self, keys: list[bytes]) -> dict[str, list[bytes]]:
         grouped: dict[str, list[bytes]] = {}
@@ -725,6 +1103,13 @@ class ClusterGateway:
             except Exception:
                 pass
         self._clients.clear()
+        jump = getattr(self, "_jump", None)
+        self._jump = None
+        if jump is not None:
+            try:
+                jump.close()
+            except Exception:
+                pass
 
 
 def _split_cursor(cursor: int, master_count: int) -> tuple[int, int]:

@@ -8,7 +8,7 @@ import threading
 from typing import Any, Optional
 
 from redisdesk.core.errors import AppError, ErrorCode
-from redisdesk.core.limits import CONNECT_TIMEOUT_S, SSH_KEEPALIVE_S
+from redisdesk.core.limits import CLUSTER_MAX_NODES, CONNECT_TIMEOUT_S, SSH_KEEPALIVE_S
 from redisdesk.core.model import SshConfig
 from redisdesk.infra.known_hosts import (
     HostKeyMismatchError,
@@ -300,3 +300,113 @@ class SshTunnel:
                     channel.close()
                 except Exception:
                     pass
+
+
+
+def _remote_key(host: str, port: int) -> tuple[str, int]:
+    return (str(host).strip(), int(port))
+
+
+class SshJumpSession:
+    """One SSH client to the bastion, with a local forward per remote Redis address."""
+
+    def __init__(
+        self,
+        config: SshConfig,
+        *,
+        password: memoryview | bytes | bytearray | str | None = None,
+        passphrase: memoryview | bytes | bytearray | str | None = None,
+        client: Any | None = None,
+        connect_timeout_s: float = CONNECT_TIMEOUT_S,
+        known_hosts_store: KnownHostsStore | None = None,
+    ) -> None:
+        self.config = config
+        self._password = password
+        self._passphrase = passphrase
+        self._known_hosts_store = known_hosts_store
+        self._external_client = client
+        self._client = client
+        self._connect_timeout_s = connect_timeout_s
+        self._tunnels: dict[tuple[str, int], SshTunnel] = {}
+        self._lock = threading.Lock()
+        self._started = False
+
+    def start(self) -> None:
+        if self._started and self._client is not None:
+            return
+        if self._client is None:
+            bootstrap = SshTunnel(
+                self.config,
+                remote_host=self.config.host or "127.0.0.1",
+                remote_port=int(self.config.port or 22),
+                password=self._password,
+                passphrase=self._passphrase,
+                connect_timeout_s=self._connect_timeout_s,
+                known_hosts_store=self._known_hosts_store,
+            )
+            self._client = bootstrap._connect_client()
+        self._started = True
+
+    def open(self, remote_host: str, remote_port: int) -> SshTunnel:
+        if not self._started or self._client is None:
+            self.start()
+        key = _remote_key(remote_host, remote_port)
+        if not key[0]:
+            raise AppError(ErrorCode.E07, "缺少 Redis 主机地址，无法建立跳板转发。")
+        with self._lock:
+            existing = self._tunnels.get(key)
+            if existing is not None and existing.local_port:
+                return existing
+            if existing is not None:
+                try:
+                    existing.close()
+                except Exception:
+                    pass
+            live = {k: tun for k, tun in self._tunnels.items() if tun.local_port}
+            self._tunnels = live
+            if len(self._tunnels) >= CLUSTER_MAX_NODES:
+                raise AppError(
+                    ErrorCode.E07,
+                    f"跳板转发超过上限（{CLUSTER_MAX_NODES}），已停止新建隧道。",
+                )
+            preferred = 0
+            if not self._tunnels:
+                preferred = int(self.config.local_port or 0)
+            from dataclasses import replace
+            cfg = replace(self.config, local_port=preferred)
+            tunnel = SshTunnel(
+                cfg,
+                remote_host=key[0],
+                remote_port=key[1],
+                password=self._password,
+                passphrase=self._passphrase,
+                client=self._client,
+                connect_timeout_s=self._connect_timeout_s,
+                known_hosts_store=self._known_hosts_store,
+            )
+            tunnel.start()
+            self._tunnels[key] = tunnel
+            return tunnel
+
+    def endpoint(self, remote_host: str, remote_port: int) -> tuple[str, int]:
+        tunnel = self.open(remote_host, remote_port)
+        if not tunnel.local_port:
+            raise AppError(ErrorCode.E07, "SSH 隧道尚未就绪。")
+        return ("127.0.0.1", int(tunnel.local_port))
+
+    def close(self) -> None:
+        with self._lock:
+            tunnels = list(self._tunnels.values())
+            self._tunnels.clear()
+        for tunnel in tunnels:
+            try:
+                tunnel.close()
+            except Exception:
+                pass
+        if self._external_client is None and self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+        self._client = self._external_client
+        self._started = False

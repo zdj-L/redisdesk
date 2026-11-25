@@ -39,6 +39,9 @@ class SlowlogRow:
     time_text: str
     duration_text: str
     command: str
+    node_label: str = ""
+    timestamp: int | None = None
+    duration_us: int | None = None
 
 
 @dataclass
@@ -50,6 +53,7 @@ class ClientRow:
     idle: str
     flags: str
     command: str
+    node_label: str = ""
 
 
 @dataclass
@@ -65,6 +69,7 @@ class DiagnosticLists:
     client_truncated: bool = False
     client_note: str = ""
     client_error: str | None = None
+    scope: str = "single"
 
 
 @dataclass
@@ -157,6 +162,8 @@ def parse_slowlog_entries(raw: object, *, display_rows: int = SLOWLOG_SHOW_ROWS)
                 time_text=format_save_time(ts),
                 duration_text=format_duration_us(duration),
                 command=command or DASH,
+                timestamp=_to_int(ts),
+                duration_us=_to_int(duration),
             )
         )
     return rows, fetched
@@ -232,7 +239,7 @@ def _exec(gw: RedisGateway, argv: list[str]) -> Any:
     return gw.execute(argv, timeout_s=SOCKET_TIMEOUT_S)
 
 
-def collect_lists(gw: RedisGateway) -> DiagnosticLists:
+def _collect_lists_single(gw: RedisGateway) -> DiagnosticLists:
     """Best-effort list pulls; a failed section does not abort INFO."""
     result = DiagnosticLists()
 
@@ -286,6 +293,102 @@ def collect_lists(gw: RedisGateway) -> DiagnosticLists:
         result.client_note = f"无法拉取客户端列表：{result.client_error}"
 
     return result
+
+
+def collect_lists(gw: RedisGateway) -> DiagnosticLists:
+    fanout = getattr(gw, "fanout_on_masters", None)
+    profile = getattr(gw, "profile", None)
+    if callable(fanout) and getattr(profile, "topology", "") == "cluster":
+        return _collect_lists_cluster(gw, fanout)
+    return _collect_lists_single(gw)
+
+
+def _collect_lists_cluster(gw: RedisGateway, fanout) -> DiagnosticLists:
+    result = DiagnosticLists(scope="cluster")
+    len_rows = fanout(["SLOWLOG", "LEN"], timeout_s=SOCKET_TIMEOUT_S, continue_on_error=True)
+    len_ok = [row for row in len_rows if row.ok]
+    len_err = [row for row in len_rows if not row.ok]
+    if len_ok:
+        result.slowlog_len = sum(_to_int(row.value) or 0 for row in len_ok)
+    get_rows = fanout(["SLOWLOG", "GET", str(SLOWLOG_FETCH_COUNT)], timeout_s=SOCKET_TIMEOUT_S, continue_on_error=True)
+    get_ok = [row for row in get_rows if row.ok]
+    get_err = [row for row in get_rows if not row.ok]
+    merged: list[SlowlogRow] = []
+    fetched = 0
+    for row in get_ok:
+        items, count = parse_slowlog_entries(row.value, display_rows=SLOWLOG_FETCH_COUNT)
+        fetched += count
+        for item in items:
+            item.node_label = row.label
+            merged.append(item)
+    result.slowlog_fetched = fetched
+    merged.sort(key=lambda item: (item.timestamp or 0, item.duration_us or 0), reverse=True)
+    result.slowlog_rows = merged[:SLOWLOG_SHOW_ROWS]
+    total = result.slowlog_len if result.slowlog_len is not None else fetched
+    shown = len(result.slowlog_rows)
+    result.slowlog_truncated = fetched > shown or (result.slowlog_len is not None and result.slowlog_len > shown)
+    ok_count = len(get_ok)
+    if not get_ok and (get_err or len_err):
+        errors = get_err or len_err
+        result.slowlog_error = "；".join(f"{row.label} {row.error}" for row in errors)
+        result.slowlog_note = "无法拉取慢查询：" + result.slowlog_error
+    elif total:
+        result.slowlog_note = (
+            f"已汇总 {ok_count} 个主节点，已显示 {shown} 条，共 {total} 条"
+            f"（每节点拉取上限 {SLOWLOG_FETCH_COUNT}，展示上限 {SLOWLOG_SHOW_ROWS}）。"
+        )
+    elif shown == 0:
+        result.slowlog_note = f"已汇总 {ok_count} 个主节点，暂无慢查询记录。"
+    else:
+        result.slowlog_note = f"已汇总 {ok_count} 个主节点，已显示 {shown} 条（展示上限 {SLOWLOG_SHOW_ROWS}）。"
+    fail_bits = [f"{row.label} 无法拉取：{row.error}" for row in (len_err + get_err)]
+    if fail_bits and get_ok:
+        result.slowlog_note = (result.slowlog_note + " " + " ".join(dict.fromkeys(fail_bits))).strip()
+    try:
+        cfg_rows = fanout(["CONFIG", "GET", "slowlog-log-slower-than"], timeout_s=SOCKET_TIMEOUT_S, continue_on_error=True)
+        hints: list[str] = []
+        for row in cfg_rows:
+            if not row.ok:
+                continue
+            hint = _slowlog_threshold_note(_config_map(row.value))
+            if hint and hint not in hints:
+                hints.append(hint)
+        if hints:
+            result.slowlog_note = (" ".join(hints) + " " + result.slowlog_note).strip()
+    except Exception:
+        pass
+    client_rows = fanout(["CLIENT", "LIST"], timeout_s=SOCKET_TIMEOUT_S, continue_on_error=True)
+    cli_ok = [row for row in client_rows if row.ok]
+    cli_err = [row for row in client_rows if not row.ok]
+    clients: list[ClientRow] = []
+    total_clients = 0
+    for row in cli_ok:
+        items, count = parse_client_list(row.value, display_max=CLIENT_SHOW_MAX)
+        total_clients += count
+        for item in items:
+            item.node_label = row.label
+            clients.append(item)
+    result.client_total = total_clients
+    result.client_rows = clients[:CLIENT_SHOW_MAX]
+    result.client_truncated = total_clients > len(result.client_rows)
+    ok_count = len(cli_ok)
+    if not cli_ok and cli_err:
+        result.client_error = "；".join(f"{row.label} {row.error}" for row in cli_err)
+        result.client_note = "无法拉取客户端列表：" + result.client_error
+    elif total_clients == 0:
+        result.client_note = f"已汇总 {ok_count} 个主节点，暂无客户端。"
+    elif result.client_truncated:
+        result.client_note = (
+            f"已汇总 {ok_count} 个主节点。客户端过多，已截断。"
+            f"已显示 {len(result.client_rows)} / 共 {total_clients} 个（上限 {CLIENT_SHOW_MAX}）。"
+        )
+    else:
+        result.client_note = f"已汇总 {ok_count} 个主节点，共 {total_clients} 个客户端。"
+    if cli_err and cli_ok:
+        result.client_note = (result.client_note + " " + " ".join(f"{row.label} 无法拉取：{row.error}" for row in cli_err)).strip()
+    return result
+
+
 
 
 def collect_snapshot(gw: RedisGateway) -> DiagnosticsSnapshot:

@@ -10,7 +10,7 @@ from pathlib import Path
 from redisdesk import __version__
 from redisdesk.infra.integrity import acquire_single_instance_mutex, check_data_dir, release_mutex, tighten_directory_acl
 from redisdesk.infra.log import setup_logging
-from redisdesk.infra.paths import app_data_dir, log_dir
+from redisdesk.infra.paths import app_data_dir, lock_app_data_dir, log_dir
 
 
 def _crash_log(exc: BaseException) -> None:
@@ -28,7 +28,7 @@ def _crash_log(exc: BaseException) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
-    data_dir = app_data_dir()
+    data_dir = lock_app_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     tighten_directory_acl(data_dir)
     if not check_data_dir(data_dir):
@@ -48,6 +48,11 @@ def main(argv: list[str] | None = None) -> int:
         raise
     finally:
         release_mutex(mutex)
+        from redisdesk.app.restart import consume_restart_request, launch_replacement_process, notify_manual_reopen
+
+        if consume_restart_request():
+            if not launch_replacement_process():
+                notify_manual_reopen()
 
 
 def _run_ui(data_dir: Path, *, startup_hook=None) -> int:

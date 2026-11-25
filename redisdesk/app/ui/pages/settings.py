@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from pathlib import Path
+
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
+    QRadioButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -20,11 +27,25 @@ from redisdesk.app.ui.theme import THEME_CHOICES, UiSettings
 from redisdesk.app.ui.update_flow import UpdateController
 from redisdesk.app.ui.dialog_kit import StyledComboBox
 from redisdesk.app.ui.jobs import FunctionWorker
-from redisdesk.app.ui.widgets import DataTable, FormSection, PageFrame
+from redisdesk.app.ui.widgets import DataTable, FormSection, PageFrame, ask_yes_no, show_information, show_warning
 from redisdesk.core.errors import AppError
 from redisdesk.core.limits import AUDIT_RETENTION_DAYS, VALUE_PAGE_SIZE
 from redisdesk.infra.known_hosts import KnownHostEntry, KnownHostsStore
-from redisdesk.infra.paths import known_hosts_path
+from redisdesk.infra.paths import (
+    KIND_APP_ROOT,
+    KIND_CUSTOM,
+    KIND_SYSTEM,
+    app_data_dir,
+    app_root,
+    apply_data_dir_change,
+    edition_default_data_dir,
+    env_override_active,
+    is_same_data_dir,
+    is_shared_or_insecure_location,
+    known_hosts_path,
+    resolve_app_data_dir,
+    target_data_dir,
+)
 from redisdesk.infra.update import PREF_AUTO_CHECK, auto_check_enabled
 
 
@@ -87,6 +108,54 @@ class SettingsPage(QWidget):
         sec_form.addRow("\u5ba1\u8ba1\u4fdd\u7559\uff08\u5929\uff09", QLabel(str(AUDIT_RETENTION_DAYS)))
         security.body.addLayout(sec_form)
         self.page.add_body(security, 0)
+
+        data = FormSection(
+            "数据目录",
+            "连接、凭证、审计、界面设置和 SSH 已知主机都保存在此目录。"
+            "保存后会写入应用旁的指针文件并迁移已有数据；必须完全退出后重新打开才会改用新路径。"
+            "环境变量 REDISDESK_APPDATA 优先级最高，存在时会覆盖指针。",
+        )
+        self.data_dir_current = QLabel("")
+        self.data_dir_current.setObjectName("hint")
+        self.data_dir_current.setWordWrap(True)
+        self.data_dir_current.setTextInteractionFlags(
+            self.data_dir_current.textInteractionFlags()
+            | self.data_dir_current.textInteractionFlags().TextSelectableByMouse
+        )
+        data.body.addWidget(self.data_dir_current)
+        self.data_dir_system = QRadioButton("系统默认（本机用户目录）")
+        self.data_dir_app = QRadioButton("应用根目录")
+        self.data_dir_custom = QRadioButton("自定义路径")
+        for radio in (self.data_dir_system, self.data_dir_app, self.data_dir_custom):
+            data.body.addWidget(radio)
+            radio.toggled.connect(self._sync_data_dir_controls)
+        custom_row = QHBoxLayout()
+        custom_row.setContentsMargins(0, 0, 0, 0)
+        self.data_dir_edit = QLineEdit()
+        self.data_dir_edit.setPlaceholderText("选择或输入文件夹")
+        self.data_dir_edit.textChanged.connect(self._sync_data_dir_controls)
+        self.data_dir_browse = QPushButton("浏览…")
+        self.data_dir_browse.setObjectName("tool")
+        self.data_dir_browse.clicked.connect(self._browse_data_dir)
+        custom_row.addWidget(self.data_dir_edit, 1)
+        custom_row.addWidget(self.data_dir_browse, 0)
+        data.body.addLayout(custom_row)
+        self.data_dir_next = QLabel("")
+        self.data_dir_next.setObjectName("hint")
+        self.data_dir_next.setWordWrap(True)
+        data.body.addWidget(self.data_dir_next)
+        save_row = QHBoxLayout()
+        save_row.setContentsMargins(0, 0, 0, 0)
+        self.data_dir_save = QPushButton("保存并迁移")
+        self.data_dir_save.setObjectName("dataDirSaveButton")
+        self.data_dir_save.setObjectName("tool")
+        self.data_dir_save.setObjectName("dataDirSaveButton")
+        self.data_dir_save.clicked.connect(self._save_data_dir)
+        save_row.addWidget(self.data_dir_save, 0)
+        save_row.addStretch(1)
+        data.body.addLayout(save_row)
+        self.page.add_body(data, 0)
+        self._refresh_data_dir_form()
 
         update = FormSection(
             "应用更新",
@@ -162,13 +231,142 @@ class SettingsPage(QWidget):
         known.body.addLayout(actions)
         self.page.add_body(known, 0)
         self.page.body.addStretch()
-        root.addWidget(self.page)
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("settingsScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll.setWidget(self.page)
+        root.addWidget(self.scroll)
         self._sync_known_actions()
         self.reload_known_hosts()
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
         self.reload_known_hosts()
+        self._refresh_data_dir_form()
+
+    def _data_dir_kind(self) -> str:
+        if self.data_dir_app.isChecked():
+            return KIND_APP_ROOT
+        if self.data_dir_custom.isChecked():
+            return KIND_CUSTOM
+        return KIND_SYSTEM
+
+    def _sync_data_dir_controls(self, _checked: bool = False) -> None:
+        custom = self.data_dir_custom.isChecked()
+        self.data_dir_edit.setEnabled(custom)
+        self.data_dir_browse.setEnabled(custom)
+        try:
+            target = target_data_dir(self._data_dir_kind(), self.data_dir_edit.text())
+            self.data_dir_next.setText("保存后将使用：" + str(target))
+        except AppError as exc:
+            self.data_dir_next.setText(exc.message)
+
+    def _refresh_data_dir_form(self) -> None:
+        current = app_data_dir()
+        restart_target = resolve_app_data_dir()
+        default = edition_default_data_dir()
+        self.data_dir_system.setText(f"系统默认（{default}）")
+        self.data_dir_app.setText(f"应用根目录（{app_root()}）")
+        lines = [f"当前进程正在使用：{current}"]
+        if restart_target.resolve() != Path(current).expanduser().resolve():
+            lines.append(f"完全退出并重新打开后将使用：{restart_target}")
+        if env_override_active():
+            lines.append("已设置环境变量 REDISDESK_APPDATA，它会覆盖指针中的路径。")
+        self.data_dir_current.setText("\n".join(lines))
+        # Keep the current radio if the user is mid-edit; on first load pick a match.
+        if not any(r.isChecked() for r in (self.data_dir_system, self.data_dir_app, self.data_dir_custom)):
+            if Path(current).expanduser().resolve() == app_root().resolve():
+                self.data_dir_app.setChecked(True)
+            elif Path(current).expanduser().resolve() == default.resolve():
+                self.data_dir_system.setChecked(True)
+            else:
+                self.data_dir_custom.setChecked(True)
+                self.data_dir_edit.setText(str(current))
+        self._sync_data_dir_controls()
+
+    def _browse_data_dir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "选择数据目录", self.data_dir_edit.text() or str(app_data_dir()))
+        if chosen:
+            self.data_dir_edit.setText(chosen)
+            self.data_dir_custom.setChecked(True)
+            self._sync_data_dir_controls()
+
+    def _save_data_dir(self) -> None:
+        kind = self._data_dir_kind()
+        custom = self.data_dir_edit.text()
+        try:
+            target = target_data_dir(kind, custom)
+        except AppError as exc:
+            show_warning(self, "无法更改数据目录", exc.message)
+            return
+        if env_override_active():
+            show_warning(
+                self,
+                "环境变量将覆盖指针",
+                "已设置 REDISDESK_APPDATA，重启后仍会使用该环境变量，不会改用本次选择的目录。"
+                "未写入指针，也未重启。请先清除该环境变量后再更改数据目录。",
+            )
+            return
+        if is_same_data_dir(target, app_data_dir()):
+            show_information(self, "无需重启", "当前已在使用该目录，无需重启。")
+            return
+        if is_shared_or_insecure_location(target):
+            if not ask_yes_no(
+                self,
+                "该位置可能不安全",
+                f"「{target}」可能是共享目录或磁盘根目录，不适宜存放连接凭证。确定仍要使用吗？",
+            ):
+                return
+            allow_insecure = True
+        else:
+            allow_insecure = False
+        from redisdesk.infra.paths import data_dir_has_payload
+
+        switch_existing = False
+        current = app_data_dir()
+        if (
+            data_dir_has_payload(target)
+            and data_dir_has_payload(current)
+            and Path(target).expanduser().resolve() != Path(current).expanduser().resolve()
+        ):
+            if not ask_yes_no(
+                self,
+                "目标目录已有数据",
+                f"「{target}」中已有 RedisDesk 数据。不会覆盖迁移。"
+                "要改用该目录中的现有数据吗？（当前目录中的数据不会被删除。）",
+            ):
+                return
+            switch_existing = True
+        try:
+            result = apply_data_dir_change(
+                kind,
+                custom,
+                allow_insecure=allow_insecure,
+                switch_to_existing=switch_existing,
+            )
+        except AppError as exc:
+            show_warning(self, "无法更改数据目录", exc.message + (f"\n{exc.hint}" if getattr(exc, "hint", None) else ""))
+            self._refresh_data_dir_form()
+            return
+        copied = "、".join(result.copied) if result.copied else "无需迁移或已在目标位置"
+        self.setEnabled(False)
+        host = self.window()
+        if host is not None and host is not self:
+            host.setEnabled(False)
+        from redisdesk.app.restart import request_forced_restart
+
+        request_forced_restart(
+            message=(
+                "数据目录已更改。迁移内容：" + copied + "。\n"
+                "当前进程不能再继续使用，以免写入旧目录。\n"
+                "即将重新打开并加载：" + str(result.next_path) + "\n"
+                "若窗口没有自动出现，请手动再打开 RedisDesk。"
+            ),
+            parent=self,
+        )
 
     def _on_update_auto(self, checked: bool) -> None:
         self.ui_settings.set(PREF_AUTO_CHECK, bool(checked))

@@ -85,6 +85,8 @@ class NodeState:
     role: str = "master"
     host: str = "127.0.0.1"
     port: int = 0
+    listen_host: str = "127.0.0.1"
+    listen_port: int = 0
     keys: dict[bytes, bytes] = field(default_factory=dict)
     commands: list[list[bytes]] = field(default_factory=list)
     require_password: bytes | None = None
@@ -233,7 +235,9 @@ def start_world(nodes: list[NodeState], *, master_name: str = "mymaster", curren
             host, port = server.server_address
             assert port not in FORBIDDEN_PORTS
             assert port != 0
-            node.host, node.port = host, int(port)
+            node.listen_host, node.listen_port = host, int(port)
+            if node.port == 0:
+                node.host, node.port = host, int(port)
             world.servers.append(server)
             world.threads.append(thread)
         yield world
@@ -287,6 +291,53 @@ def no_real_redis(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", guarded)
     yield
 
+
+
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+def _ssh_mapping(world):
+    return {(node.host, int(node.port)): (node.listen_host, node.listen_port) for node in world.nodes}
+
+
+def _advertise(world):
+    sentinels = [node for node in world.nodes if node.kind == "sentinel"]
+    redises = [node for node in world.nodes if node.kind == "redis"]
+    for index, node in enumerate(sentinels):
+        node.host = f"10.94.2.{11 + index}"
+        node.port = 27001 + index
+    for index, node in enumerate(redises):
+        node.host = f"10.94.2.{21 + index}"
+        node.port = 7101 + index
+    return _ssh_mapping(world)
+
+
+def _fake_ssh(world, mapping=None):
+    from tests.test_ssh_tunnel import FakeSSHClient
+    mapping = mapping or _ssh_mapping(world)
+    first = next(iter(mapping.values()))
+    return FakeSSHClient(first[0], first[1], mapping=mapping)
+
+
+def _sentinel_ssh_profile(world, **kwargs):
+    return replace(
+        sentinel_profile(world, **kwargs),
+        transport="ssh",
+        ssh=SshConfig(host="bastion.internal", port=22, username="ops", auth_mode="password"),
+    )
+
+
+def _guard_loopback(monkeypatch):
+    real_connect = socket.socket.connect
+
+    def guarded(self, address):
+        host = address[0] if isinstance(address, tuple) else address
+        port = address[1] if isinstance(address, tuple) and len(address) >= 2 else None
+        if port in FORBIDDEN_PORTS or (isinstance(host, str) and host not in LOOPBACK):
+            raise AssertionError(f"refused connect to real network target {address}")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded)
 
 def test_discover_master_info_scan_and_db(no_real_redis):
     with start_world(typical_nodes()) as world:
@@ -380,21 +431,42 @@ def test_failover_retries_reads_but_not_writes(no_real_redis):
             gw.close()
 
 
-def test_sentinel_ssh_is_deferred_e07():
-    profile = ConnectionProfile(
-        id="c-ssh",
-        name="sentinel-ssh",
-        topology="sentinel",
-        transport="ssh",
-        endpoint=Endpoint("10.0.0.8", 26379),
-        sentinel=SentinelConfig(master_name="mymaster", sentinels=(Endpoint("10.0.0.8", 26379),)),
-        ssh=SshConfig(host="bastion.example", port=22, username="ops"),
-        tls=_plain_tls(),
-    )
-    with pytest.raises(AppError) as exc:
-        open_gateway(profile)
-    assert exc.value.code == ErrorCode.E07
-    assert "SSH" in exc.value.message
+def test_sentinel_ssh_routes_discovery_and_failover_through_jump(monkeypatch):
+    _guard_loopback(monkeypatch)
+    with start_world(typical_nodes()) as world:
+        mapping = _advertise(world)
+        client = _fake_ssh(world, mapping)
+        profile = _sentinel_ssh_profile(world)
+        gw = open_gateway(profile, ssh_password="pw", ssh_client=client)
+        try:
+            info = gw.info()
+            assert info.get("sentinel_master_name") == "mymaster"
+            assert gw.ping() >= 0
+            assert gw.execute(["SET", "alpha", "1"], timeout_s=3) in {True, b"OK", "OK"}
+            assert gw.execute(["GET", "alpha"], timeout_s=3) == b"1"
+            host = gw._master_gw._client.connection_pool.connection_kwargs["host"]
+            assert host == "127.0.0.1"
+            dests = {(d[1][0], int(d[1][1])) for d in client.transport.destinations}
+            current = world.current_master()
+            assert (current.host, current.port) in dests
+            sentinels = [n for n in world.nodes if n.kind == "sentinel"]
+            assert any((n.host, n.port) in dests for n in sentinels)
+            assert all(n.port not in FORBIDDEN_PORTS for n in world.nodes)
+
+            old_master = current
+            world.failover("master-b")
+            new_master = world.current_master()
+            assert new_master is not old_master
+            assert gw.execute(["GET", "alpha"], timeout_s=3) == b"1"
+            dests = {(d[1][0], int(d[1][1])) for d in client.transport.destinations}
+            assert (new_master.host, new_master.port) in dests
+            host = gw._master_gw._client.connection_pool.connection_kwargs["host"]
+            assert host == "127.0.0.1"
+            ep = gw._master_endpoint
+            assert ep is not None
+            assert (ep.host, ep.port) == (new_master.host, new_master.port)
+        finally:
+            gw.close()
 
 
 def test_tls_plaintext_policy_and_store_roundtrip(tmp_store, no_real_redis):
@@ -557,8 +629,19 @@ def test_dialog_sentinel_mode_create_and_validation(qapp_sentinel):
     assert dlg.sentinel_extra.isVisible()
     assert dlg.db.isEnabled()
     assert dlg.port.value() == 26379
-    assert not dlg.use_ssh.isEnabled()
+    assert dlg.use_ssh.isEnabled()
     assert not dlg.use_ssh.isChecked()
+    dlg.use_ssh.setChecked(True)
+    dlg.ssh_host.setText("bastion.example")
+    dlg.ssh_username.setText("ops")
+    dlg.ssh_password.setText("secret")
+    QApplication.processEvents()
+    ssh_profile = dlg.profile()
+    assert ssh_profile.transport == "ssh"
+    assert ssh_profile.ssh is not None
+    assert ssh_profile.ssh.host == "bastion.example"
+    dlg.use_ssh.setChecked(False)
+    QApplication.processEvents()
     dlg.name.setText("sentinel-lab")
     dlg.host.setText("127.0.0.1")
     dlg.port.setValue(27001)
@@ -620,4 +703,118 @@ def test_dialog_test_connect_stays_off_gui_thread(qapp_sentinel, tmp_store, audi
         QApplication.processEvents()
         text = dlg.status_label.text()
         assert "已成功连接" in text
+        dlg.close()
+
+
+def test_sentinel_ssh_known_hosts_mismatch_is_refused(monkeypatch):
+    _guard_loopback(monkeypatch)
+    from redisdesk.infra.known_hosts import HostKeyMismatchError, UnknownHostKeyError
+
+    def unknown(self):
+        raise UnknownHostKeyError(
+            host="bastion.internal",
+            port=22,
+            key=SimpleNamespace(get_name=lambda: "ssh-ed25519", asbytes=lambda: b"k" * 32),
+            policy="tofu",
+        )
+
+    def mismatch(self):
+        raise HostKeyMismatchError(
+            host="bastion.internal",
+            port=22,
+            expected_fingerprint="AA",
+            actual_fingerprint="BB",
+            key_type="ssh-ed25519",
+        )
+
+    profile = ConnectionProfile(
+        id="s-ssh-kh",
+        name="sentinel-ssh",
+        topology="sentinel",
+        transport="ssh",
+        endpoint=Endpoint("10.94.2.11", 27001),
+        db=0,
+        sentinel=SentinelConfig(master_name="mymaster", sentinels=(Endpoint("10.94.2.11", 27001),)),
+        ssh=SshConfig(host="bastion.internal", port=22, username="ops", auth_mode="password"),
+        tls=_plain_tls(),
+    )
+    monkeypatch.setattr("redisdesk.infra.tunnel.SshTunnel._connect_client", unknown)
+    with pytest.raises(AppError) as exc:
+        open_gateway(profile, ssh_password="pw")
+    assert exc.value.code == ErrorCode.E07
+    assert "SSH" in exc.value.message
+    monkeypatch.setattr("redisdesk.infra.tunnel.SshTunnel._connect_client", mismatch)
+    with pytest.raises(AppError) as exc:
+        open_gateway(profile, ssh_password="pw")
+    assert exc.value.code == ErrorCode.E07
+    assert "不一致" in exc.value.message or "已拒绝" in exc.value.message
+
+
+def test_sentinel_ssh_tls_plaintext_policy(monkeypatch):
+    _guard_loopback(monkeypatch)
+    profile = ConnectionProfile(
+        id="s-ssh-tls",
+        name="sentinel-ssh-tls",
+        topology="sentinel",
+        transport="ssh",
+        endpoint=Endpoint("10.94.2.11", 27001),
+        db=0,
+        sentinel=SentinelConfig(master_name="mymaster", sentinels=(Endpoint("10.94.2.11", 27001),)),
+        ssh=SshConfig(host="bastion.internal", port=22, username="ops", auth_mode="password"),
+        tls=TlsConfig(enabled=False, allow_plaintext=True, plaintext_reason="short"),
+    )
+    with pytest.raises(AppError) as exc:
+        require_tls_or_exception(profile.tls)
+    blob = f"{exc.value.message} {exc.value.hint}"
+    assert exc.value.code == ErrorCode.E01
+    assert "10" in blob or "理由" in blob or "明文" in blob
+    profile = replace(profile, tls=TlsConfig(enabled=False, allow_plaintext=False, plaintext_reason=None))
+    with pytest.raises(AppError):
+        require_tls_or_exception(profile.tls)
+
+
+def test_dialog_sentinel_ssh_test_connect_stays_off_gui_thread(qapp_sentinel, tmp_store, audit, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from redisdesk.app.ui.dialogs import ConnectionEditorDialog
+    from redisdesk.infra.tunnel import SshTunnel
+
+    _guard_loopback(monkeypatch)
+    grants = StaticGrantResolver({("c-sentinel", "admin")})
+    svc = ConnectionService(tmp_store, audit, grants)
+    with start_world(typical_nodes()) as world:
+        mapping = _advertise(world)
+        fake = _fake_ssh(world, mapping)
+        monkeypatch.setattr(SshTunnel, "_connect_client", lambda self: fake)
+        dlg = ConnectionEditorDialog(session=make_session("admin"), service=svc)
+        dlg.show()
+        QApplication.processEvents()
+        for i in range(dlg.topology.count()):
+            if dlg.topology.itemData(i) == "sentinel":
+                dlg.topology.setCurrentIndex(i)
+                break
+        sentinels = [n for n in world.nodes if n.kind == "sentinel"]
+        dlg.name.setText("sentinel-ssh-lab")
+        dlg.host.setText(sentinels[0].host)
+        dlg.port.setValue(sentinels[0].port)
+        if len(sentinels) > 1:
+            dlg.sentinel_extra.setPlainText(f"{sentinels[1].host}:{sentinels[1].port}")
+        dlg.master_name.setText("mymaster")
+        dlg.tls.setChecked(False)
+        dlg.allow_plain.setChecked(True)
+        dlg.reason.setText("isolated-mock-sentinel-ssh-lab")
+        dlg.use_ssh.setChecked(True)
+        dlg.ssh_host.setText("bastion.internal")
+        dlg.ssh_username.setText("ops")
+        dlg.ssh_password.setText("secret")
+        QApplication.processEvents()
+        dlg.test_button.click()
+        QApplication.processEvents()
+        if dlg._test_worker is not None:
+            assert dlg._test_worker.wait(5000)
+        QApplication.processEvents()
+        assert "已成功连接" in dlg.status_label.text()
+        dests = {(d[1][0], int(d[1][1])) for d in fake.transport.destinations}
+        assert (sentinels[0].host, sentinels[0].port) in dests
+        master = world.current_master()
+        assert (master.host, master.port) in dests
         dlg.close()

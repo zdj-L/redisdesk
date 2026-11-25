@@ -117,9 +117,10 @@ class SockChannel:
 
 
 class FakeTransport:
-    def __init__(self, real_host: str, real_port: int):
+    def __init__(self, real_host: str, real_port: int, mapping=None):
         self.real_host = real_host
         self.real_port = real_port
+        self.mapping = {(str(h), int(p)): (str(rh), int(rp)) for (h, p), (rh, rp) in (mapping or {}).items()}
         self.destinations = []
         self._active = True
 
@@ -131,7 +132,11 @@ class FakeTransport:
 
     def open_channel(self, kind, dest, origin):
         self.destinations.append((kind, dest, origin))
-        sock = socket.create_connection((self.real_host, self.real_port), timeout=2)
+        key = (str(dest[0]), int(dest[1]))
+        target = self.mapping.get(key, (self.real_host, self.real_port))
+        if target[0] not in {"127.0.0.1", "::1", "localhost"}:
+            raise AssertionError(f"fake SSH mapped to non-loopback {target}")
+        sock = socket.create_connection(target, timeout=2)
         return SockChannel(sock)
 
     def close(self):
@@ -139,8 +144,8 @@ class FakeTransport:
 
 
 class FakeSSHClient:
-    def __init__(self, real_host: str, real_port: int):
-        self.transport = FakeTransport(real_host, real_port)
+    def __init__(self, real_host: str, real_port: int, mapping=None):
+        self.transport = FakeTransport(real_host, real_port, mapping=mapping)
         self.connect_kwargs = None
 
     def connect(self, **kwargs):
@@ -281,3 +286,24 @@ def test_capture_connection_dialog_ssh(qapp):
         path = artifacts / f"{name}{suffix}.png"
         assert dlg.grab().save(str(path), "PNG")
     dlg.close()
+
+
+def test_tunnel_ssl_connection_uses_logical_hostname(monkeypatch):
+    import ssl as sslmod
+    from redisdesk.adapters.direct import _get_tunnel_ssl_connection_class
+
+    seen = {}
+    orig = sslmod.SSLContext.wrap_socket
+
+    def wrap(self, sock, *args, **kwargs):
+        seen["server_hostname"] = kwargs.get("server_hostname")
+        return sock
+
+    monkeypatch.setattr(sslmod.SSLContext, "wrap_socket", wrap)
+    cls = _get_tunnel_ssl_connection_class()
+    conn = cls(host="127.0.0.1", port=1, db=0, tls_server_hostname="redis.internal")
+    class _Sock:
+        def close(self):
+            return None
+    assert conn._wrap_socket_with_ssl(_Sock()) is not None
+    assert seen.get("server_hostname") == "redis.internal"

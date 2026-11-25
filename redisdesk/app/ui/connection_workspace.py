@@ -8,7 +8,7 @@ from PySide6.QtGui import QKeySequence, QShortcut, QGuiApplication
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
     QPlainTextEdit, QSplitter, QTreeWidget, QTreeWidgetItem, QTabWidget,
-    QStackedWidget, QInputDialog, QSizePolicy, QAbstractItemView,
+    QStackedWidget, QInputDialog, QMessageBox, QSizePolicy, QAbstractItemView,
 )
 
 from redisdesk.app.services.workspace_session import WorkspaceSession, display_bytes
@@ -442,7 +442,7 @@ class KeyBrowser(QWidget):
 
 
 class KeyDetail(QWidget):
-    request_command = Signal(str)
+    request_command = Signal(object)
 
     def __init__(self, io, parent=None):
         super().__init__(parent)
@@ -505,6 +505,15 @@ class KeyDetail(QWidget):
             widget.setCursor(Qt.CursorShape.PointingHandCursor)
             widget.hide()
             actions.addWidget(widget)
+        self.string_edit = QPushButton('编辑字符串值')
+        self.list_edit = QPushButton('编辑选中元素的值')
+        self.set_edit = QPushButton('编辑选中成员')
+        self.zset_edit = QPushButton('编辑选中成员或分数')
+        for widget in (self.string_edit, self.list_edit, self.set_edit, self.zset_edit):
+            widget.setObjectName('tool')
+            widget.setCursor(Qt.CursorShape.PointingHandCursor)
+            widget.hide()
+            actions.addWidget(widget)
         self.string_more = QPushButton('加载下一块')
         self.string_more.setObjectName('tool')
         self.string_more.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -516,9 +525,9 @@ class KeyDetail(QWidget):
         self.views.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.string_view = StringViewer()
         self.hash_view = FieldTableViewer(['字段', '值'], '该哈希的字段将按页显示。', action_label='编辑')
-        self.list_view = FieldTableViewer(['索引', '值'], '列表元素按页显示。')
-        self.set_view = FieldTableViewer(['成员'], '集合成员按页显示。')
-        self.zset_view = FieldTableViewer(['成员', '分数'], '有序集合成员按页显示。')
+        self.list_view = FieldTableViewer(['索引', '值'], '列表元素按页显示。', action_label='编辑')
+        self.set_view = FieldTableViewer(['成员'], '集合成员按页显示。', action_label='编辑')
+        self.zset_view = FieldTableViewer(['成员', '分数'], '有序集合成员按页显示。', action_label='编辑')
         self.stream_view = FieldTableViewer(['消息 ID', '内容'], '流消息按 ID 分页显示。')
         for view in (self.string_view, self.hash_view, self.list_view, self.set_view, self.zset_view, self.stream_view):
             view.layout().setContentsMargins(0, 0, 0, 0)
@@ -544,14 +553,28 @@ class KeyDetail(QWidget):
         self.hash_del.clicked.connect(self.delete_hash_field)
         self.hash_edit.clicked.connect(self.edit_hash_field)
         self.hash_view.row_action_requested.connect(self.edit_hash_field)
-        self.hash_view.table.itemSelectionChanged.connect(self._sync_hash_actions)
+        self.hash_view.table.itemSelectionChanged.connect(self._sync_value_actions)
         self.hash_view.table.doubleClicked.connect(lambda index: self.edit_hash_field(index.row()))
+        self.string_edit.clicked.connect(self.edit_string_value)
+        self.list_edit.clicked.connect(self.edit_list_element)
+        self.set_edit.clicked.connect(self.edit_set_member)
+        self.zset_edit.clicked.connect(self.edit_zset_row)
+        self.list_view.row_action_requested.connect(self.edit_list_element)
+        self.set_view.row_action_requested.connect(self.edit_set_member)
+        self.zset_view.row_action_requested.connect(self.edit_zset_row)
+        self.list_view.table.itemSelectionChanged.connect(self._sync_value_actions)
+        self.set_view.table.itemSelectionChanged.connect(self._sync_value_actions)
+        self.zset_view.table.itemSelectionChanged.connect(self._sync_value_actions)
+        self.list_view.table.doubleClicked.connect(lambda index: self.edit_list_element(index.row()))
+        self.set_view.table.doubleClicked.connect(lambda index: self.edit_set_member(index.row()))
+        self.zset_view.table.doubleClicked.connect(lambda index: self.edit_zset_row(index.row()))
         self.string_more.clicked.connect(self.next_value)
         self.string_view.more.clicked.connect(self.next_value)
         for view in (self.hash_view, self.list_view, self.set_view, self.zset_view, self.stream_view):
             view.next.clicked.connect(self.next_value)
             view.prev.clicked.connect(self.prev_value)
         self._pending_hash_field = None
+        self._pending_restore = None
         self.set_ready(False)
         self.show_empty('请选择键')
 
@@ -580,23 +603,24 @@ class KeyDetail(QWidget):
             self.show_empty('请先连接此工作区')
             return
         self.current_key = key
+        self.last_value = None
         self.history = []
         self.value_generation += 1
         self.load_value(key, 0, None, replace=True)
 
-    def load_value(self, key, token, kind, *, replace=False, select_hash_field=None):
+    def load_value(self, key, token, kind, *, replace=False, select_hash_field=None, restore=None):
         generation = self.value_generation
         self.value_more.setEnabled(False)
         self.io.submit(
             lambda runtime: runtime.read_value(key, token, kind),
-            lambda result: self.render_value(result, replace=replace, select_hash_field=select_hash_field) if generation == self.value_generation else None,
+            lambda result: self.render_value(result, replace=replace, select_hash_field=select_hash_field, restore=restore) if generation == self.value_generation else None,
             lambda exc: self._failed(error_text(exc)) if generation == self.value_generation else None,
         )
 
     def _failed(self, message):
         self.show_empty('读取失败：' + message)
 
-    def render_value(self, result, *, replace=False, select_hash_field=None):
+    def render_value(self, result, *, replace=False, select_hash_field=None, restore=None):
         if replace:
             self.history = [result]
         else:
@@ -613,11 +637,15 @@ class KeyDetail(QWidget):
         total = result['total']
         self.size_label.setText('' if total is None else (f'{total} 字节' if kind == 'string' else f'{total} 项'))
         writable = can_quote(result['key'])
-        for widget in (self.ttl_btn, self.rename_btn, self.delete_btn, self.hash_add, self.hash_del, self.hash_edit):
+        for widget in (self.ttl_btn, self.rename_btn, self.delete_btn, self.hash_add, self.hash_del, self.hash_edit, self.string_edit, self.list_edit, self.set_edit, self.zset_edit):
             widget.setEnabled(writable and self.ready)
         self.hash_add.setVisible(kind == 'hash')
         self.hash_del.setVisible(kind == 'hash')
         self.hash_edit.setVisible(kind == 'hash')
+        self.string_edit.setVisible(kind == 'string')
+        self.list_edit.setVisible(kind == 'list')
+        self.set_edit.setVisible(kind == 'set')
+        self.zset_edit.setVisible(kind == 'zset')
         self.ttl_btn.setToolTip('' if writable else '二进制键请通过控制台操作')
         index = {'string': 0, 'hash': 1, 'list': 2, 'set': 3, 'zset': 4, 'stream': 5}.get(kind, 0)
         self.views.setCurrentIndex(index)
@@ -636,18 +664,22 @@ class KeyDetail(QWidget):
             )
             self.string_view.show_page(page)
         elif kind == 'hash':
-            self.hash_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index)
+            self.hash_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index, identities=result.get('identities') or None)
         elif kind == 'list':
-            self.list_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index)
+            self.list_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index, identities=result.get('identities') or None)
         elif kind == 'set':
-            self.set_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index)
+            self.set_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index, identities=result.get('identities') or None)
         elif kind == 'zset':
-            self.zset_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index)
+            self.zset_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index, identities=result.get('identities') or None)
         else:
             self.stream_view.show_page(rows, total=total, has_more=result['more'], page_index=page_index)
-        if kind == 'hash':
-            self._restore_hash_selection(select_hash_field)
-        self._sync_hash_actions()
+        if restore is None and select_hash_field:
+            restore = ('hash', select_hash_field)
+        if restore:
+            view = {'hash': self.hash_view, 'list': self.list_view, 'set': self.set_view, 'zset': self.zset_view}.get(restore[0])
+            if view is not None:
+                self._restore_row_selection(view, restore[1])
+        self._sync_value_actions()
         # Collection paging lives on the table viewer; strings use a compact toolbar button.
         self.value_more.hide()
         self.value_prev.hide()
@@ -667,11 +699,13 @@ class KeyDetail(QWidget):
             self.history.pop()
             self.render_value(self.history.pop(), replace=False)
 
-    def refresh(self, select_hash_field=None):
+    def refresh(self, select_hash_field=None, restore=None):
         if self.current_key:
             self.value_generation += 1
             self.history = []
-            self.load_value(self.current_key, 0, None, replace=True, select_hash_field=select_hash_field)
+            if isinstance(select_hash_field, bool):
+                select_hash_field = None
+            self.load_value(self.current_key, 0, None, replace=True, select_hash_field=select_hash_field, restore=restore)
 
     def copy_key(self):
         if self.current_key is None:
@@ -740,39 +774,116 @@ class KeyDetail(QWidget):
         item = table.item(row, 1) if row is not None and row >= 0 else None
         return '' if item is None else item.text()
 
-    def _sync_hash_actions(self):
-        writable = bool(
+    def _current_kind(self):
+        return self.last_value['kind'] if self.last_value else None
+
+    def _writable_key(self, kind=None):
+        return bool(
             self.ready
             and self.current_key
             and can_quote(self.current_key)
             and self.last_value
-            and self.last_value['kind'] == 'hash'
+            and (kind is None or self.last_value['kind'] == kind)
         )
-        selected = self._hash_field_at() is not None
-        self.hash_add.setEnabled(writable)
-        self.hash_del.setEnabled(writable)
-        self.hash_edit.setEnabled(writable and selected)
-        if hasattr(self.hash_view, 'action_label') and self.hash_view.action_label:
-            for row in range(self.hash_view.table.rowCount()):
-                host = self.hash_view.table.cellWidget(row, self.hash_view.table.columnCount() - 1)
-                if host is not None:
-                    host.setEnabled(writable)
 
-    def _restore_hash_selection(self, field):
-        if not field:
+    def _is_masked(self, value):
+        return '已遮罩' in (value or '')
+
+    def _table_row(self, view, row=None):
+        table = view.table
+        if row is None:
+            row = table.currentRow()
+        elif 0 <= row < table.rowCount():
+            table.selectRow(row)
+            row = table.currentRow()
+        return row
+
+    def _row_identity(self, view, row=None):
+        table = view.table
+        row = self._table_row(view, row)
+        item = table.item(row, 0) if row is not None and row >= 0 else None
+        if item is None:
+            return None
+        ident = item.data(Qt.ItemDataRole.UserRole)
+        return item.text() if ident is None else ident
+
+    def _cell_text(self, view, row=None, column=0):
+        table = view.table
+        if row is None:
+            row = table.currentRow()
+        item = table.item(row, column) if row is not None and row >= 0 else None
+        return '' if item is None else item.text()
+
+    def _hash_field_at(self, row=None):
+        return self._row_identity(self.hash_view, row)
+
+    def _hash_displayed_value(self, row=None):
+        return self._cell_text(self.hash_view, row, 1)
+
+    def _enable_row_actions(self, view, enabled):
+        if not getattr(view, 'action_label', None):
             return
-        table = self.hash_view.table
+        for row in range(view.table.rowCount()):
+            host = view.table.cellWidget(row, view.table.columnCount() - 1)
+            if host is not None:
+                host.setEnabled(enabled)
+
+    def _sync_value_actions(self):
+        kind = self._current_kind()
+        writable = self._writable_key(kind)
+        hash_ok = writable and kind == 'hash'
+        hash_sel = self._row_identity(self.hash_view) is not None
+        self.hash_add.setEnabled(hash_ok)
+        self.hash_del.setEnabled(hash_ok)
+        self.hash_edit.setEnabled(hash_ok and hash_sel)
+        self._enable_row_actions(self.hash_view, hash_ok)
+        self.string_edit.setEnabled(writable and kind == 'string')
+        list_ok = writable and kind == 'list'
+        set_ok = writable and kind == 'set'
+        zset_ok = writable and kind == 'zset'
+        self.list_edit.setEnabled(list_ok and self._row_identity(self.list_view) is not None)
+        self.set_edit.setEnabled(set_ok and self._row_identity(self.set_view) is not None)
+        self.zset_edit.setEnabled(zset_ok and self._row_identity(self.zset_view) is not None)
+        self._enable_row_actions(self.list_view, list_ok)
+        self._enable_row_actions(self.set_view, set_ok)
+        self._enable_row_actions(self.zset_view, zset_ok)
+
+    def _sync_hash_actions(self):
+        self._sync_value_actions()
+
+    def _restore_row_selection(self, view, identity):
+        if not identity:
+            return
+        table = view.table
         for row in range(table.rowCount()):
             item = table.item(row, 0)
-            if item is not None and item.text() == field:
+            if item is None:
+                continue
+            ident = item.data(Qt.ItemDataRole.UserRole)
+            if ident is None:
+                ident = item.text()
+            if ident == identity or item.text() == identity:
                 table.setCurrentCell(row, 0)
                 table.setCurrentItem(item)
                 table.selectRow(row)
                 table.scrollToItem(item)
                 return
 
+    def _restore_hash_selection(self, field):
+        self._restore_row_selection(self.hash_view, field)
+
+    def _emit_commands(self, *commands, restore=None):
+        commands = [item for item in commands if item]
+        if not commands:
+            return
+        self._pending_restore = restore
+        if restore and restore[0] == 'hash':
+            self._pending_hash_field = restore[1]
+        payload = commands[0] if len(commands) == 1 else list(commands)
+        self.request_command.emit(payload)
+
     def edit_hash_field(self, row=None):
-        if not self.current_key or not can_quote(self.current_key) or not self.last_value or self.last_value['kind'] != 'hash':
+        if not self._writable_key('hash'):
             return
         if isinstance(row, bool):
             row = None
@@ -780,7 +891,7 @@ class KeyDetail(QWidget):
         if field is None:
             return
         displayed = self._hash_displayed_value()
-        masked = '已遮罩' in displayed
+        masked = self._is_masked(displayed)
         prompt = '字段「' + field + '」的新值'
         if masked:
             prompt += '（当前值已遮罩，不会回填遮罩文本；输入内容将作为新值写入）'
@@ -789,9 +900,111 @@ class KeyDetail(QWidget):
         if not ok:
             return
         self._pending_hash_field = field
-        self.request_command.emit(
-            f'HSET {quote_command([self.current_key])} {quote_command([field])} {quote_command([value])}'
+        self._emit_commands(
+            f'HSET {quote_command([self.current_key])} {quote_command([field])} {quote_command([value])}',
+            restore=('hash', field),
         )
+
+    def edit_string_value(self):
+        if not self._writable_key('string'):
+            return
+        displayed = ''
+        if self.last_value and self.last_value['rows']:
+            displayed = self.last_value['rows'][0][0]
+        masked = self._is_masked(displayed)
+        incomplete = bool(self.last_value.get('more')) or len(self.history) > 1
+        prompt = '键的新字符串值'
+        if masked:
+            prompt += '（当前值已遮罩，不会回填遮罩文本；输入内容将作为新值写入并覆盖整个键）'
+        elif incomplete:
+            prompt += '（当前只显示了部分内容，输入将作为完整新值覆盖整个键，不会拼接未加载的部分）'
+        initial = '' if (masked or incomplete) else displayed
+        value, ok = QInputDialog.getMultiLineText(self, '编辑字符串值', prompt, initial)
+        if not ok:
+            return
+        self._emit_commands(f'SET {quote_command([self.current_key])} {quote_command([value])}')
+
+    def edit_list_element(self, row=None):
+        if not self._writable_key('list'):
+            return
+        if isinstance(row, bool):
+            row = None
+        index = self._row_identity(self.list_view, row)
+        if index is None:
+            return
+        displayed = self._cell_text(self.list_view, None, 1)
+        masked = self._is_masked(displayed)
+        prompt = '索引 ' + str(index) + ' 的新值'
+        if masked:
+            prompt += '（当前值已遮罩，不会回填遮罩文本；输入内容将作为新值写入）'
+        initial = '' if masked else displayed
+        value, ok = QInputDialog.getMultiLineText(self, '编辑选中元素的值', prompt, initial)
+        if not ok:
+            return
+        self._emit_commands(
+            f'LSET {quote_command([self.current_key])} {index} {quote_command([value])}',
+            restore=('list', str(index)),
+        )
+
+    def edit_set_member(self, row=None):
+        if not self._writable_key('set'):
+            return
+        if isinstance(row, bool):
+            row = None
+        old = self._row_identity(self.set_view, row)
+        if old is None:
+            return
+        displayed = self._cell_text(self.set_view, None, 0)
+        masked = self._is_masked(displayed)
+        prompt = '新的集合成员'
+        if masked:
+            prompt += '（当前成员已遮罩，不会回填遮罩文本；确认后将写入新成员并移除原来的成员）'
+        initial = '' if masked else displayed
+        value, ok = QInputDialog.getMultiLineText(self, '编辑选中成员', prompt, initial)
+        if not ok or value == old:
+            return
+        key = quote_command([self.current_key])
+        self._emit_commands(
+            f'SADD {key} {quote_command([value])}',
+            f'SREM {key} {quote_command([old])}',
+            restore=('set', value),
+        )
+
+    def edit_zset_row(self, row=None):
+        if not self._writable_key('zset'):
+            return
+        if isinstance(row, bool):
+            row = None
+        old = self._row_identity(self.zset_view, row)
+        if old is None:
+            return
+        displayed_member = self._cell_text(self.zset_view, None, 0)
+        displayed_score = self._cell_text(self.zset_view, None, 1)
+        masked = self._is_masked(displayed_member)
+        prompt = '成员'
+        if masked:
+            prompt += '（当前成员已遮罩，不会回填遮罩文本）'
+        initial = '' if masked else displayed_member
+        member, ok = QInputDialog.getText(self, '编辑选中成员或分数', prompt, text=initial)
+        if not ok:
+            return
+        score, ok = QInputDialog.getText(self, '编辑选中成员或分数', '分数', text=displayed_score)
+        if not ok:
+            return
+        score = score.strip()
+        try:
+            float(score)
+        except ValueError:
+            QMessageBox.warning(self, '编辑选中成员或分数', '分数必须是数字，未发送命令。')
+            return
+        if member == old and score == displayed_score.strip():
+            return
+        key = quote_command([self.current_key])
+        commands = [f'ZADD {key} {score} {quote_command([member])}']
+        if member != old:
+            commands.append(f'ZREM {key} {quote_command([old])}')
+        self._emit_commands(*commands, restore=('zset', member))
+
 
 
 class WorkspaceConsole(QWidget):
@@ -856,30 +1069,43 @@ class WorkspaceConsole(QWidget):
     def execute(self, raw=None, *, on_success=None):
         if raw is None or isinstance(raw, bool):
             raw = self.input.toPlainText().strip()
-        if not raw or not self.ready or self.busy:
+        if isinstance(raw, (list, tuple)):
+            raws = [item for item in raw if item]
+        else:
+            raws = [raw] if raw else []
+        if not raws or not self.ready or self.busy:
             return
         self.busy = True
         self._on_success = on_success
         self.run.setEnabled(False)
         def prepare(runtime):
-            return runtime.prepare_console(self.console, raw, preview=True)
-        self.io.submit(prepare, lambda prepared: self._review(raw, prepared), self._error)
+            return [runtime.prepare_console(self.console, item, preview=True) for item in raws]
+        self.io.submit(prepare, lambda prepared: self._review(raws, prepared), self._error)
 
-    def _review(self, raw, prepared):
+    def _review(self, raws, prepared_list):
         if not self.ready:
             self._settled()
             return
-        decision = prepared.policy
+        if not isinstance(prepared_list, list):
+            prepared_list = [prepared_list]
+            raws = [raws] if isinstance(raws, str) else list(raws)
         confirmed = False
         typed = ''
-        if decision.decision in {'confirm', 'typed_confirm'}:
+        needing = [item for item in prepared_list if item.policy.decision in {'confirm', 'typed_confirm'}]
+        if needing:
             profile = self.io.runtime.profile
+            command = '\n'.join(format_argv_masked(list(item.argv)) for item in prepared_list)
+            reasons = []
+            for item in needing:
+                reason = item.policy.assessment.reason
+                if reason and reason not in reasons:
+                    reasons.append(reason)
             dlg = ConfirmRiskDialog(
                 title=f'确认在「{profile.name}」执行',
-                command=format_argv_masked(list(prepared.argv)),
-                consequence=decision.assessment.reason,
+                command=command,
+                consequence='；'.join(reasons) if reasons else needing[0].policy.assessment.reason,
                 typed_text=profile.name,
-                require_typed=decision.requires_typed_confirm,
+                require_typed=any(item.policy.requires_typed_confirm for item in prepared_list),
                 parent=self,
             )
             if not dlg.exec():
@@ -888,19 +1114,28 @@ class WorkspaceConsole(QWidget):
                 self._settled()
                 return
             confirmed = True
-            typed = dlg.typed.text() if decision.requires_typed_confirm else ''
-        self.append('$ ' + format_argv_masked(list(prepared.argv)))
-        self.io.submit(lambda runtime: runtime.execute_confirmed(self.console, raw, confirmed, typed), self._result, self._error)
+            typed = dlg.typed.text() if any(item.policy.requires_typed_confirm for item in prepared_list) else ''
+        for item in prepared_list:
+            self.append('$ ' + format_argv_masked(list(item.argv)))
+        def work(runtime):
+            results = []
+            for raw in raws:
+                results.append(runtime.execute_confirmed(self.console, raw, confirmed, typed))
+            return results
+        self.io.submit(work, self._result, self._error)
 
     def _result(self, result):
-        rows = '\n'.join(' | '.join(row) for row in result.rows)
-        tone = '成功' if result.ok else '失败'
-        self.append(f'{tone}  [{result.argv_name}  {result.duration_ms} ms]\n' + (rows[:65536] or '(空结果)'))
+        results = result if isinstance(result, list) else [result]
+        for item in results:
+            rows = '\n'.join(' | '.join(row) for row in item.rows)
+            tone = '成功' if item.ok else '失败'
+            self.append(f'{tone}  [{item.argv_name}  {item.duration_ms} ms]\n' + (rows[:65536] or '(空结果)'))
         callback = getattr(self, '_on_success', None)
         self._on_success = None
         self._settled()
-        if result.ok and callback:
-            callback(result)
+        last = results[-1] if results else None
+        if last and last.ok and callback:
+            callback(last)
 
     def _error(self, exc):
         self.append('失败 / 未执行成功：' + error_text(exc))
@@ -1066,16 +1301,20 @@ class ConnectionWorkspace(QWidget):
         if widget is not None:
             widget.deleteLater()
 
-    def run_command(self, raw: str):
+    def run_command(self, raw):
         # Workspace actions keep the key view visible; confirmation still uses the existing console write path.
         self.console.execute(raw, on_success=self._after_detail_write)
 
     def _after_detail_write(self, result):
         if not result.ok or not self.detail.current_key:
             return
+        restore = getattr(self.detail, '_pending_restore', None)
+        self.detail._pending_restore = None
         field = getattr(self.detail, '_pending_hash_field', None)
         self.detail._pending_hash_field = None
-        self.detail.refresh(select_hash_field=field)
+        if restore is None and field:
+            restore = ('hash', field)
+        self.detail.refresh(restore=restore)
         self.tabs.setCurrentWidget(self.detail)
 
     def _mark_h_split_adjusted(self, *_args):

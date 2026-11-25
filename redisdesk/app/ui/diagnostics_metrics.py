@@ -254,13 +254,23 @@ def _plain(info: Mapping[str, object], key: str) -> str:
 def build_card_pairs(info: Mapping[str, object] | None) -> dict[str, list[tuple[str, str]]]:
     data: Mapping[str, object] = info or {}
     role = _text(data, "role")
+    server_pairs = [
+        ("版本", _plain(data, "redis_version")),
+        ("操作系统", _plain(data, "os")),
+        ("运行时间", format_uptime(_text(data, "uptime_in_seconds"))),
+        ("运行模式", format_mode(_text(data, "redis_mode"))),
+    ]
+    if _text(data, "redis_mode").lower() == "cluster" and _text(data, "cluster_masters"):
+        total = _text(data, "cluster_masters")
+        ok = _text(data, "cluster_info_ok") or total
+        failed_raw = _as_int(_text(data, "cluster_info_failed"))
+        failed = failed_raw or 0
+        if failed > 0:
+            server_pairs.append(("汇总范围", f"已汇总 {ok}/{total} 个主节点，{failed} 个未能拉取"))
+        else:
+            server_pairs.append(("汇总范围", f"已汇总全部 {total} 个主节点"))
     return {
-        CARD_SERVER: [
-            ("\u7248\u672c", _plain(data, "redis_version")),
-            ("\u64cd\u4f5c\u7cfb\u7edf", _plain(data, "os")),
-            ("\u8fd0\u884c\u65f6\u95f4", format_uptime(_text(data, "uptime_in_seconds"))),
-            ("\u8fd0\u884c\u6a21\u5f0f", format_mode(_text(data, "redis_mode"))),
-        ],
+        CARD_SERVER: server_pairs,
         CARD_MEMORY: [
             ("\u5df2\u7528\u5185\u5b58", _plain(data, "used_memory_human")),
             ("\u5185\u5b58\u5cf0\u503c", _plain(data, "used_memory_peak_human")),

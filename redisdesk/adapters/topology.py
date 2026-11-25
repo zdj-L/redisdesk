@@ -7,7 +7,38 @@ from redisdesk.adapters.direct import DirectGateway
 from redisdesk.adapters.gateway import GatewayNotImplemented, RedisGateway
 from redisdesk.core.errors import AppError, ErrorCode
 from redisdesk.core.model import ConnectionProfile
-from redisdesk.infra.tunnel import SshTunnel, classify_ssh_error
+from redisdesk.infra.tunnel import SshJumpSession, SshTunnel, classify_ssh_error
+
+
+
+def _classify_jump(exc, profile, *, redis_host="", redis_port=0):
+    return classify_ssh_error(
+        exc,
+        bastion_host=profile.ssh.host if profile.ssh else "",
+        bastion_port=int(profile.ssh.port or 22) if profile.ssh else 22,
+        redis_host=redis_host or (profile.host or ""),
+        redis_port=int(redis_port or profile.port or 0),
+        phase="bastion",
+    )
+
+
+def _start_jump(profile, *, ssh_password=None, ssh_passphrase=None, ssh_client=None):
+    if profile.transport != "ssh":
+        return None
+    if profile.ssh is None or not profile.ssh.host:
+        raise AppError(ErrorCode.E07, "请填写 SSH 跳板主机与端口。")
+    jump = SshJumpSession(
+        profile.ssh,
+        password=ssh_password,
+        passphrase=ssh_passphrase,
+        client=ssh_client,
+    )
+    try:
+        jump.start()
+    except Exception as exc:  # noqa: BLE001
+        jump.close()
+        raise _classify_jump(exc, profile) from exc
+    return jump
 
 
 class TopologyResolver:
@@ -22,13 +53,38 @@ class TopologyResolver:
         sentinel_password: memoryview | bytes | str | None = None,
     ) -> RedisGateway:
         if profile.topology == "sentinel":
-            if profile.transport == "ssh":
-                raise AppError(ErrorCode.E07, "当前版本的哨兵连接暂不支持 SSH 跳板（发现主节点后地址会变化，需要再为新主节点建立隧道）。请改用 TCP 直连。")
-            return SentinelGateway(profile, password=password, sentinel_password=sentinel_password)
+            jump = None
+            try:
+                jump = _start_jump(
+                    profile,
+                    ssh_password=ssh_password,
+                    ssh_passphrase=ssh_passphrase,
+                    ssh_client=ssh_client,
+                )
+                return SentinelGateway(
+                    profile,
+                    password=password,
+                    sentinel_password=sentinel_password,
+                    jump=jump,
+                )
+            except Exception:
+                if jump is not None:
+                    jump.close()
+                raise
         if profile.topology == "cluster":
-            if profile.transport == "ssh":
-                raise AppError(ErrorCode.E07, "\u5f53\u524d\u7248\u672c\u7684\u96c6\u7fa4\u8fde\u63a5\u6682\u4e0d\u652f\u6301 SSH \u8df3\u677f\uff08\u91cd\u5b9a\u5411\u4f1a\u8fde\u5230\u5176\u4ed6\u8282\u70b9\uff0c\u9700\u8981\u6309\u8282\u70b9\u6620\u5c04\uff09\u3002\u8bf7\u6539\u7528 TCP \u76f4\u8fde\u3002")
-            return ClusterGateway(profile, password=password)
+            jump = None
+            try:
+                jump = _start_jump(
+                    profile,
+                    ssh_password=ssh_password,
+                    ssh_passphrase=ssh_passphrase,
+                    ssh_client=ssh_client,
+                )
+                return ClusterGateway(profile, password=password, jump=jump)
+            except Exception:
+                if jump is not None:
+                    jump.close()
+                raise
         if profile.topology != "direct":
             raise AppError(ErrorCode.E01, f"未知拓扑 {profile.topology}")
 

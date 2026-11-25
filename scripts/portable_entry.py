@@ -8,8 +8,12 @@ INTERNAL_APPDATA_FAMILY = "1.0.0"
 
 
 def configure_portable_data():
+    """Register the preview default. Do not set REDISDESK_APPDATA so a pointer or env can win."""
+    from redisdesk.infra.paths import set_packaged_default_data_dir
+
     base = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
-    os.environ.setdefault("REDISDESK_APPDATA", str(base / "RedisDesk-Internal" / INTERNAL_APPDATA_FAMILY))
+    set_packaged_default_data_dir(base / "RedisDesk-Internal" / INTERNAL_APPDATA_FAMILY)
+
 
 if __name__ == "__main__":
     configure_portable_data()

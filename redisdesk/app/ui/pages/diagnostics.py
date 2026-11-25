@@ -171,11 +171,30 @@ class DiagListSection(QWidget):
         return margins.top() + sum(parts) + spacing * (len(parts) - 1) + margins.bottom()
 
 
+SLOWLOG_HEADERS = ["ID", "时间", "耗时", "命令"]
+SLOWLOG_HEADERS_CLUSTER = ["节点", "ID", "时间", "耗时", "命令"]
+CLIENT_HEADERS = ["ID", "地址", "名称", "库", "空闲", "标志", "命令"]
+CLIENT_HEADERS_CLUSTER = ["节点", "ID", "地址", "名称", "库", "空闲", "标志", "命令"]
+
+
+def _lists_are_cluster(lists: DiagnosticLists) -> bool:
+    if getattr(lists, "scope", "single") == "cluster":
+        return True
+    return any(getattr(row, "node_label", "") for row in lists.slowlog_rows + lists.client_rows)
+
+
 def _slowlog_rows(lists: DiagnosticLists) -> list[list[str]]:
+    if _lists_are_cluster(lists):
+        return [[row.node_label or "—", row.log_id, row.time_text, row.duration_text, row.command] for row in lists.slowlog_rows]
     return [[row.log_id, row.time_text, row.duration_text, row.command] for row in lists.slowlog_rows]
 
 
 def _client_rows(lists: DiagnosticLists) -> list[list[str]]:
+    if _lists_are_cluster(lists):
+        return [
+            [row.node_label or "—", row.client_id, row.addr, row.name, row.db, row.idle, row.flags, row.command]
+            for row in lists.client_rows
+        ]
     return [
         [row.client_id, row.addr, row.name, row.db, row.idle, row.flags, row.command]
         for row in lists.client_rows
@@ -307,6 +326,9 @@ class DiagnosticsPage(QWidget):
 
     def show_lists(self, lists: DiagnosticLists | None) -> None:
         data = lists or DiagnosticLists()
+        cluster = _lists_are_cluster(data)
+        self.slowlog_section.table.set_headers(SLOWLOG_HEADERS_CLUSTER if cluster else SLOWLOG_HEADERS)
+        self.client_list_section.table.set_headers(CLIENT_HEADERS_CLUSTER if cluster else CLIENT_HEADERS)
         self.slowlog_section.set_rows(
             _slowlog_rows(data),
             data.slowlog_note or ("\u65e0\u6cd5\u62c9\u53d6\u6162\u67e5\u8be2\uff1a{0}".format(data.slowlog_error) if data.slowlog_error else "\u6682\u65e0\u6570\u636e"),

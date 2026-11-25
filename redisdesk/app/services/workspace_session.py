@@ -274,6 +274,7 @@ class WorkspaceSession:
         if expected_type and kind != expected_type:
             raise AppError(ErrorCode.E04, '键类型已变化，请重新点击键刷新。')
         rows, more, next_token, total = [], False, None, None
+        identities = []
         def masked(value, field=None):
             text = display_bytes(value)
             return self.matcher.match(key=key.decode('utf-8', errors='surrogateescape'), field=field,
@@ -298,16 +299,23 @@ class WorkspaceSession:
             more = next_token != 0
             if kind == 'hash':
                 pairs = payload.items() if isinstance(payload, dict) else zip(payload[::2], payload[1::2])
+                pairs = list(pairs)
                 rows = [(display_bytes(k), masked(v, display_bytes(k))) for k, v in pairs]
+                identities = [display_bytes(k) for k, v in pairs]
             elif kind == 'zset':
                 pairs = payload if not payload or isinstance(payload[0], (list, tuple)) else zip(payload[::2], payload[1::2])
+                pairs = list(pairs)
                 rows = [(masked(k), display_bytes(score)) for k, score in pairs]
+                identities = [display_bytes(k) for k, score in pairs]
             else:
-                rows = [(masked(k),) for k in payload]
+                members = list(payload)
+                rows = [(masked(k),) for k in members]
+                identities = [display_bytes(k) for k in members]
         elif kind == 'list':
             total = int(command('LLEN', key))
             values = command('LRANGE', key, str(token), str(token + 99))
             rows = [(str(token + i), masked(v)) for i, v in enumerate(values)]
+            identities = [str(token + i) for i in range(len(values))]
             next_token = token + len(values)
             more = next_token < total
         elif kind == 'stream':
@@ -316,13 +324,14 @@ class WorkspaceSession:
             for entry_id, fields in entries:
                 pairs = fields.items() if isinstance(fields, dict) else zip(fields[::2], fields[1::2])
                 rows.append((display_bytes(entry_id), '\n'.join(display_bytes(f) + ': ' + masked(v, display_bytes(f)) for f, v in pairs)))
+                identities.append(display_bytes(entry_id))
             if entries:
                 major, minor = display_bytes(entries[-1][0]).split('-')
                 next_token = major + '-' + str(int(minor) + 1)
             more = len(entries) == 100
         else:
             rows = [('暂不支持此类型：' + kind,)]
-        return dict(key=key, kind=kind, ttl=ttl, total=total, rows=rows, more=more, token=next_token)
+        return dict(key=key, kind=kind, ttl=ttl, total=total, rows=rows, more=more, token=next_token, identities=identities)
 
     def prepare_console(self, console, raw, *, preview=False):
         self._ready(Action.EXEC_L1)

@@ -163,8 +163,10 @@ class FieldTableViewer(QWidget):
         self.next.setEnabled(False)
         self.filter.setText("")
 
-    def show_page(self, rows: list[list[str]], *, total: int | None, has_more: bool, page_index: int, note: str = "") -> None:
-        self._all_rows = rows
+    def show_page(self, rows: list[list[str]], *, total: int | None, has_more: bool, page_index: int, note: str = "", identities: list | None = None) -> None:
+        if identities is None:
+            identities = [None] * len(rows)
+        self._all_rows = list(zip(list(rows), list(identities)))
         self._apply_filter()
         total_text = f"共 {total} 条" if total is not None else f"{len(rows)} 条"
         self.page_info.setText(f"{total_text} · 第 {page_index + 1} 页")
@@ -178,11 +180,14 @@ class FieldTableViewer(QWidget):
 
     def _apply_filter(self) -> None:
         keyword = self.filter.text().strip().lower()
-        if not keyword:
-            visible = self._all_rows
-        else:
-            visible = [row for row in self._all_rows if any(keyword in cell.lower() for cell in row)]
-        self.table.set_rows(visible)
+        paired = self._all_rows
+        if keyword:
+            paired = [item for item in paired if any(keyword in cell.lower() for cell in item[0])]
+        self.table.set_rows([row for row, _ident in paired])
+        for r, (_row, ident) in enumerate(paired):
+            item = self.table.item(r, 0)
+            if item is not None and ident is not None:
+                item.setData(Qt.ItemDataRole.UserRole, ident)
         self._install_row_actions()
 
     def _install_row_actions(self) -> None:

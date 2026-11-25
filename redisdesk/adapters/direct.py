@@ -21,6 +21,29 @@ from redisdesk.core.model import ConnectionProfile, NodeInfo, TlsConfig
 # 不得出现全量读取命令（见 docs/04 §9）
 
 
+
+
+def _get_tunnel_ssl_connection_class():
+    """SSL connection that uses the logical Redis hostname for SNI when tunneled."""
+    from redis.connection import SSLConnection
+
+    class TunnelSSLConnection(SSLConnection):
+        def __init__(self, *args, tls_server_hostname=None, **kwargs):
+            self.tls_server_hostname = kwargs.pop('tls_server_hostname', tls_server_hostname)
+            super().__init__(*args, **kwargs)
+
+        def _wrap_socket_with_ssl(self, sock):
+            hostname = self.tls_server_hostname or self.host
+            original = self.host
+            self.host = hostname
+            try:
+                return super()._wrap_socket_with_ssl(sock)
+            finally:
+                self.host = original
+
+    return TunnelSSLConnection
+
+
 class DirectGateway:
     def __init__(
         self,

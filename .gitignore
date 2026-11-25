@@ -33,6 +33,8 @@ logs/
 *.dpapi
 *.enc
 ui-settings.json
+redisdesk-datadir.txt
+known_hosts_redisdesk
 connections.json
 connections-*.json
 credentials*.json

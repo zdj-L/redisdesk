@@ -8,6 +8,7 @@ from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QCursor, QFont, QPainter, QPalette
 from PySide6.QtWidgets import (
     QDialogButtonBox,
+    QMessageBox,
     QFrame,
     QHBoxLayout,
     QAbstractScrollArea,
@@ -57,6 +58,59 @@ def localize_dialog_buttons(box: QDialogButtonBox) -> None:
             button.setText(text)
 
 
+_MESSAGE_BOX_LABELS = {
+    "Ok": "确定",
+    "Cancel": "取消",
+    "Save": "保存",
+    "Yes": "是",
+    "No": "否",
+    "Close": "关闭",
+    "Apply": "应用",
+    "Retry": "重试",
+}
+
+
+def localize_message_box(box: QMessageBox) -> None:
+    """把标准按钮改成与 localize_dialog_buttons 相同的中文。"""
+    for name, text in _MESSAGE_BOX_LABELS.items():
+        standard = getattr(QMessageBox.StandardButton, name, None)
+        if standard is None:
+            continue
+        button = box.button(standard)
+        if button is not None:
+            button.setText(text)
+
+
+def ask_yes_no(parent, title: str, text: str) -> bool:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    localize_message_box(box)
+    return box.exec() == QMessageBox.StandardButton.Yes
+
+
+def show_information(parent, title: str, text: str) -> None:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Information)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(QMessageBox.StandardButton.Ok)
+    localize_message_box(box)
+    box.exec()
+
+
+def show_warning(parent, title: str, text: str) -> None:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(QMessageBox.StandardButton.Ok)
+    localize_message_box(box)
+    box.exec()
+
+
 class Card(QFrame):
     def __init__(self, title: str = "", parent: QWidget | None = None, *, elevated: bool = True) -> None:
         super().__init__(parent)
@@ -94,6 +148,10 @@ class FormSection(QFrame):
     def __init__(self, title: str, description: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("formSection")
+        # Drop shadows break QLabel height-for-width and can composite
+        # wrapped text on top of itself; the card already has a QSS border.
+        self.setProperty("noElevation", True)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(SPACE)
@@ -104,12 +162,14 @@ class FormSection(QFrame):
             hint = QLabel(description)
             hint.setObjectName("hint")
             hint.setWordWrap(True)
+            hint.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
             root.addWidget(hint)
         self.body = QVBoxLayout()
         self.body.setContentsMargins(0, 4, 0, 0)
         self.body.setSpacing(SPACE)
         root.addLayout(self.body)
-        apply_elevation(self, level="sm")
+        apply_elevation(self, level="none")
 
 
 class PageFrame(QWidget):

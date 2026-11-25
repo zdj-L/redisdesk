@@ -488,6 +488,9 @@ QMainWindow { background: $bg; }
 QDialog { background: $surface; }
 QWidget#content { background: $bg; }
 QWidget#pageRoot { background: transparent; }
+QScrollArea#settingsScroll, QScrollArea#settingsScroll > QWidget {
+    background: transparent; border: none;
+}
 QLabel#pageTitle { font-size: 18px; font-weight: 600; color: $text_primary; background: transparent; }
 QLabel#emptyTitle { font-size: 20px; font-weight: 600; color: $text_primary; background: transparent; padding: 0 8px; }
 QLabel#emptyHint { font-size: 13px; color: $text_secondary; background: transparent; padding: 0 8px; }

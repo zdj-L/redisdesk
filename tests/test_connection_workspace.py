@@ -56,17 +56,35 @@ class Handler(socketserver.StreamRequestHandler):
             elif cmd==b'TYPE':
                 value={b'h':'hash',b'l':'list',b's':'set',b'z':'zset',b'x':'stream',b'gone':'none'}.get(parts[1],'string')
             elif cmd==b'TTL':value=60
-            elif cmd==b'STRLEN':value=len(getattr(self.server,'string_value',b'value'))
+            elif cmd==b'STRLEN':
+                store=getattr(self.server,'strings',None)
+                if store is not None and parts[1] in store:
+                    value=len(store[parts[1]])
+                else:
+                    value=len(getattr(self.server,'string_value',b'value'))
             elif cmd==b'GET':
                 if parts[1]==b'fail':
                     self.wfile.write(b'-ERR simulated failure\r\n');self.wfile.flush();continue
-                value=getattr(self.server,'string_value',b'value')
-            elif cmd==b'GETRANGE':value=getattr(self.server,'string_value',b'value')[int(parts[2]):int(parts[3])+1]
+                store=getattr(self.server,'strings',None)
+                if store is not None and parts[1] in store:
+                    value=store[parts[1]]
+                else:
+                    value=getattr(self.server,'string_value',b'value')
+            elif cmd==b'GETRANGE':
+                store=getattr(self.server,'strings',None)
+                data=store[parts[1]] if store is not None and parts[1] in store else getattr(self.server,'string_value',b'value')
+                value=data[int(parts[2]):int(parts[3])+1]
             elif cmd==b'LLEN':value=len(getattr(self.server,'list_values',[b'a',b'b']))
             elif cmd in {b'HLEN',b'SCARD',b'ZCARD',b'XLEN'}:
-                store=getattr(self.server,'hashes',None)
-                if cmd==b'HLEN' and store is not None and parts[1] in store:
-                    value=len(store[parts[1]])
+                if cmd==b'HLEN':
+                    store=getattr(self.server,'hashes',None)
+                    value=len(store[parts[1]]) if store is not None and parts[1] in store else 2
+                elif cmd==b'SCARD':
+                    store=getattr(self.server,'sets',None)
+                    value=len(store[parts[1]]) if store is not None and parts[1] in store else 2
+                elif cmd==b'ZCARD':
+                    store=getattr(self.server,'zsets',None)
+                    value=len(store[parts[1]]) if store is not None and parts[1] in store else 2
                 else:
                     value=2
             elif cmd==b'HSCAN':
@@ -86,14 +104,79 @@ class Handler(socketserver.StreamRequestHandler):
                 created=0 if parts[2] in bucket else 1
                 bucket[parts[2]]=parts[3]
                 value=created
-            elif cmd==b'SSCAN':value=[b'0',[b'a',b'b']]
-            elif cmd==b'ZSCAN':value=[b'0',[b'a',b'1',b'b',b'2']]
+            elif cmd==b'SSCAN':
+                store=getattr(self.server,'sets',None)
+                if store is not None and parts[1] in store:
+                    value=[b'0',list(store[parts[1]])]
+                else:
+                    value=[b'0',[b'a',b'b']]
+            elif cmd==b'ZSCAN':
+                store=getattr(self.server,'zsets',None)
+                if store is not None and parts[1] in store:
+                    flat=[]
+                    for member,score in store[parts[1]].items():
+                        flat.extend([member,score])
+                    value=[b'0',flat]
+                else:
+                    value=[b'0',[b'a',b'1',b'b',b'2']]
             elif cmd==b'LRANGE':value=getattr(self.server,'list_values',[b'a',b'b'])[int(parts[2]):int(parts[3])+1]
+            elif cmd==b'LSET':
+                values=list(getattr(self.server,'list_values',[b'a',b'b']))
+                idx=int(parts[2])
+                if idx<0 or idx>=len(values):
+                    self.wfile.write(b'-ERR index out of range\r\n');self.wfile.flush();continue
+                values[idx]=parts[3]
+                self.server.list_values=values
+                value='OK'
+            elif cmd==b'SADD':
+                if not hasattr(self.server,'sets') or self.server.sets is None:
+                    self.server.sets={}
+                bucket=self.server.sets.setdefault(parts[1],[b'a',b'b'] if parts[1]==b's' else [])
+                added=0
+                for member in parts[2:]:
+                    if member not in bucket:
+                        bucket.append(member);added+=1
+                value=added
+            elif cmd==b'SREM':
+                if not hasattr(self.server,'sets') or self.server.sets is None:
+                    self.server.sets={}
+                bucket=self.server.sets.setdefault(parts[1],[b'a',b'b'] if parts[1]==b's' else [])
+                removed=0
+                for member in parts[2:]:
+                    if member in bucket:
+                        bucket.remove(member);removed+=1
+                value=removed
+            elif cmd==b'ZADD':
+                if not hasattr(self.server,'zsets') or self.server.zsets is None:
+                    self.server.zsets={}
+                bucket=self.server.zsets.setdefault(parts[1],{b'a':b'1',b'b':b'2'} if parts[1]==b'z' else {})
+                added=0
+                payload=parts[2:]
+                for i in range(0,len(payload),2):
+                    score,member=payload[i],payload[i+1]
+                    if member not in bucket:
+                        added+=1
+                    bucket[member]=score
+                value=added
+            elif cmd==b'ZREM':
+                if not hasattr(self.server,'zsets') or self.server.zsets is None:
+                    self.server.zsets={}
+                bucket=self.server.zsets.setdefault(parts[1],{b'a':b'1',b'b':b'2'} if parts[1]==b'z' else {})
+                removed=0
+                for member in parts[2:]:
+                    if member in bucket:
+                        del bucket[member];removed+=1
+                value=removed
             elif cmd==b'XRANGE':
                 entries=getattr(self.server,'stream_values',[[b'1-0',[b'field',b'value']]])
                 offset=0 if parts[2]==b'-' else int(parts[2].split(b'-')[1])
                 value=entries[offset:offset+100]
-            elif cmd==b'SET':value='OK'  # writes stay only in this isolated test server
+            elif cmd==b'SET':
+                if not hasattr(self.server,'strings') or self.server.strings is None:
+                    self.server.strings={}
+                self.server.strings[parts[1]]=parts[2]
+                value='OK'  # writes stay only in this isolated test server
+
             else:
                 self.wfile.write(b'-NOPERM command denied\r\n');self.wfile.flush();continue
             self.wfile.write(resp(value));self.wfile.flush()
@@ -931,6 +1014,281 @@ def test_hash_edit_row_action_is_discoverable(qapp, services, wire, monkeypatch)
         button.click()
         pump_until(lambda: any(p == [b'HSET', b'h', b'field', b'from-row-action'] for p in wire.commands) and not workspace.console.busy)
         pump_until(lambda: workspace.detail.hash_view.table.item(0, 1).text() == 'from-row-action')
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def _open_key(workspace, key):
+    workspace.open_key(key)
+    pump_until(lambda: workspace.detail.last_value is not None and workspace.detail.last_value.get("key") == key and workspace.detail.current_key == key)
+
+
+def _capture_multiline(monkeypatch, reply, bucket):
+    def fake(*args, **kwargs):
+        bucket.append({"args": args, "kwargs": kwargs})
+        return reply, True
+    monkeypatch.setattr("redisdesk.app.ui.connection_workspace.QInputDialog.getMultiLineText", fake)
+
+
+def test_string_edit_replaces_value_and_stays_on_details(qapp, services, wire, monkeypatch):
+    workspace, console, session, profile = _open_connected_workspace(qapp, services)
+    try:
+        _select_key(workspace, b"cache:a")
+        assert workspace.detail.string_edit.isVisible()
+        assert workspace.detail.string_edit.isEnabled()
+        assert not workspace.detail.list_edit.isVisible()
+        _accept_confirm(monkeypatch, accepted=True)
+        prompts = []
+        _capture_multiline(monkeypatch, "updated-string", prompts)
+        workspace.detail.string_edit.click()
+        pump_until(lambda: any(p == [b"SET", b"cache:a", b"updated-string"] for p in wire.commands) and not workspace.console.busy)
+        pump_until(lambda: "updated-string" in workspace.detail.string_view.body.toPlainText())
+        assert workspace.tabs.currentWidget() is workspace.detail
+        assert workspace.detail.last_value["kind"] == "string"
+        # Prefill used the current unmasked value, not a later command.
+        initial = prompts[0]["args"][3] if len(prompts[0]["args"]) > 3 else prompts[0]["kwargs"].get("text", "")
+        assert initial == "value"
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_list_edit_selected_element_uses_lset(qapp, services, wire, monkeypatch):
+    workspace, console, session, profile = _open_connected_workspace(qapp, services)
+    try:
+        _open_key(workspace, b"l")
+        assert workspace.detail.list_edit.isVisible()
+        assert not workspace.detail.list_edit.isEnabled()
+        workspace.detail.list_view.table.selectRow(0)
+        QApplication.processEvents()
+        assert workspace.detail.list_edit.isEnabled()
+        _accept_confirm(monkeypatch, accepted=True)
+        _capture_multiline(monkeypatch, "updated-list", [])
+        workspace.detail.list_edit.click()
+        pump_until(lambda: any(p == [b"LSET", b"l", b"0", b"updated-list"] for p in wire.commands) and not workspace.console.busy)
+        pump_until(lambda: workspace.detail.list_view.table.item(0, 1) is not None and workspace.detail.list_view.table.item(0, 1).text() == "updated-list")
+        table = workspace.detail.list_view.table
+        assert table.item(table.currentRow(), 0).text() == "0"
+        assert workspace.tabs.currentWidget() is workspace.detail
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_set_edit_replaces_member_with_sadd_then_srem(qapp, services, wire, monkeypatch):
+    workspace, console, session, profile = _open_connected_workspace(qapp, services)
+    try:
+        _open_key(workspace, b"s")
+        workspace.detail.set_view.table.selectRow(0)
+        QApplication.processEvents()
+        old = workspace.detail.set_view.table.item(0, 0).text()
+        assert old == "a"
+        _accept_confirm(monkeypatch, accepted=True)
+        _capture_multiline(monkeypatch, "c", [])
+        workspace.detail.set_edit.click()
+        pump_until(lambda: any(p == [b"SADD", b"s", b"c"] for p in wire.commands) and any(p == [b"SREM", b"s", b"a"] for p in wire.commands) and not workspace.console.busy)
+        sadd_at = wire.commands.index([b"SADD", b"s", b"c"])
+        srem_at = wire.commands.index([b"SREM", b"s", b"a"])
+        assert sadd_at < srem_at
+        pump_until(lambda: any(workspace.detail.set_view.table.item(r, 0) and workspace.detail.set_view.table.item(r, 0).text() == "c" for r in range(workspace.detail.set_view.table.rowCount())))
+        table = workspace.detail.set_view.table
+        selected = table.item(table.currentRow(), 0)
+        assert selected is not None and selected.text() == "c"
+        assert not any(table.item(r, 0).text() == "a" for r in range(table.rowCount()) if table.item(r, 0))
+        assert workspace.tabs.currentWidget() is workspace.detail
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_zset_edit_member_and_score(qapp, services, wire, monkeypatch):
+    workspace, console, session, profile = _open_connected_workspace(qapp, services)
+    try:
+        _open_key(workspace, b"z")
+        workspace.detail.zset_view.table.selectRow(0)
+        QApplication.processEvents()
+        assert workspace.detail.zset_view.table.item(0, 0).text() == "a"
+        answers = iter([("a2", True), ("3", True)])
+        monkeypatch.setattr(
+            "redisdesk.app.ui.connection_workspace.QInputDialog.getText",
+            lambda *args, **kwargs: next(answers),
+        )
+        _accept_confirm(monkeypatch, accepted=True)
+        workspace.detail.zset_edit.click()
+        pump_until(lambda: any(p == [b"ZADD", b"z", b"3", b"a2"] for p in wire.commands) and any(p == [b"ZREM", b"z", b"a"] for p in wire.commands) and not workspace.console.busy)
+        zadd_at = wire.commands.index([b"ZADD", b"z", b"3", b"a2"])
+        zrem_at = wire.commands.index([b"ZREM", b"z", b"a"])
+        assert zadd_at < zrem_at
+        pump_until(lambda: any(workspace.detail.zset_view.table.item(r, 0) and workspace.detail.zset_view.table.item(r, 0).text() == "a2" for r in range(workspace.detail.zset_view.table.rowCount())))
+        table = workspace.detail.zset_view.table
+        row = table.currentRow()
+        assert table.item(row, 0).text() == "a2"
+        assert float(table.item(row, 1).text()) == 3.0
+        assert workspace.tabs.currentWidget() is workspace.detail
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_value_edit_requires_selection_and_matching_type(qapp, services, wire, monkeypatch):
+    workspace, console, session, profile = _open_connected_workspace(qapp, services)
+    try:
+        prompted = []
+        _capture_multiline(monkeypatch, "nope", prompted)
+        _accept_confirm(monkeypatch, accepted=True)
+        _open_key(workspace, b"l")
+        workspace.detail.list_view.table.clearSelection()
+        workspace.detail.list_view.table.setCurrentCell(-1, -1)
+        QApplication.processEvents()
+        assert not workspace.detail.list_edit.isEnabled()
+        workspace.detail.edit_list_element()
+        QApplication.processEvents()
+        assert prompted == []
+        assert not any(p[0] == b"LSET" for p in wire.commands)
+
+        _select_key(workspace, b"cache:a")
+        pump_until(lambda: workspace.detail.last_value is not None and workspace.detail.last_value["kind"] == "string")
+        assert workspace.detail.string_edit.isVisible()
+        assert not workspace.detail.list_edit.isVisible()
+        assert not workspace.detail.set_edit.isVisible()
+        assert not workspace.detail.zset_edit.isVisible()
+        assert not workspace.detail.hash_edit.isVisible()
+        workspace.detail.edit_list_element()
+        workspace.detail.edit_set_member()
+        workspace.detail.edit_zset_row()
+        workspace.detail.edit_hash_field()
+        QApplication.processEvents()
+        assert prompted == []
+        assert not any(p[0] in {b"LSET", b"SADD", b"SREM", b"ZADD", b"ZREM", b"HSET"} for p in wire.commands)
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_value_edit_production_readonly_and_cancelled_confirm_do_not_write(qapp, services, wire, monkeypatch):
+    connections, console, session, profile = services
+    readonly = replace(profile, env="prod", protection="readonly")
+    workspace = ConnectionWorkspace(connections, console, session, readonly)
+    workspace.resize(1000, 700)
+    workspace.show()
+    try:
+        pump_until(lambda: workspace.state == "connected")
+        pump_until(lambda: not workspace.browser.busy and workspace.browser.tree.topLevelItemCount() > 0)
+        _select_key(workspace, b"cache:a")
+        _accept_confirm(monkeypatch, accepted=True)
+        _capture_multiline(monkeypatch, "should-not-write", [])
+        workspace.detail.string_edit.click()
+        pump_until(lambda: not workspace.console.busy)
+        assert not any(p[0] == b"SET" for p in wire.commands)
+        assert "value" in workspace.detail.string_view.body.toPlainText()
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+    workspace = ConnectionWorkspace(connections, console, session, profile)
+    workspace.resize(1000, 700)
+    workspace.show()
+    try:
+        pump_until(lambda: workspace.state == "connected")
+        pump_until(lambda: not workspace.browser.busy and workspace.browser.tree.topLevelItemCount() > 0)
+        _open_key(workspace, b"l")
+        workspace.detail.list_view.table.selectRow(0)
+        QApplication.processEvents()
+        _accept_confirm(monkeypatch, accepted=False)
+        _capture_multiline(monkeypatch, "cancelled-value", [])
+        workspace.detail.list_edit.click()
+        pump_until(lambda: not workspace.console.busy)
+        assert not any(p[0] == b"LSET" for p in wire.commands)
+        assert "已取消" in workspace.console.output.toPlainText()
+        assert workspace.detail.list_view.table.item(0, 1).text() == "a"
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_value_edit_viewer_authz_does_not_write(qapp, services, wire, monkeypatch):
+    connections, console, session, profile = services
+    connections.grants._grants.add(("c1", "viewer"))
+    viewer = make_session("viewer")
+    workspace = ConnectionWorkspace(connections, console, viewer, profile)
+    workspace.resize(1000, 700)
+    workspace.show()
+    try:
+        pump_until(lambda: workspace.state == "connected")
+        pump_until(lambda: not workspace.browser.busy and workspace.browser.tree.topLevelItemCount() > 0)
+        _open_key(workspace, b"s")
+        workspace.detail.set_view.table.selectRow(0)
+        QApplication.processEvents()
+        _accept_confirm(monkeypatch, accepted=True)
+        _capture_multiline(monkeypatch, "viewer-denied", [])
+        workspace.detail.set_edit.click()
+        pump_until(lambda: not workspace.console.busy)
+        assert not any(p[0] in {b"SADD", b"SREM"} for p in wire.commands)
+        members = [workspace.detail.set_view.table.item(r, 0).text() for r in range(workspace.detail.set_view.table.rowCount())]
+        assert members == ["a", "b"]
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_value_edit_entry_points_are_discoverable(qapp, services, wire, monkeypatch):
+    workspace, console, session, profile = _open_connected_workspace(qapp, services)
+    try:
+        _open_key(workspace, b"l")
+        table = workspace.detail.list_view.table
+        assert table.horizontalHeaderItem(2).text() == "操作"
+        host = table.cellWidget(0, 2)
+        assert host is not None
+        button = host.findChild(type(workspace.detail.list_edit))
+        assert button is not None and button.text() == "编辑"
+        _accept_confirm(monkeypatch, accepted=True)
+        _capture_multiline(monkeypatch, "from-row-action", [])
+        button.click()
+        pump_until(lambda: any(p == [b"LSET", b"l", b"0", b"from-row-action"] for p in wire.commands) and not workspace.console.busy)
+        pump_until(lambda: workspace.detail.list_view.table.item(0, 1).text() == "from-row-action")
+
+        _open_key(workspace, b"s")
+        set_table = workspace.detail.set_view.table
+        assert set_table.horizontalHeaderItem(1).text() == "操作"
+        assert set_table.cellWidget(0, 1) is not None
+        _open_key(workspace, b"z")
+        z_table = workspace.detail.zset_view.table
+        assert z_table.horizontalHeaderItem(2).text() == "操作"
+        assert z_table.cellWidget(0, 2) is not None
+        assert workspace.detail.zset_edit.isVisible()
+        assert workspace.detail.string_edit.text() == "编辑字符串值"
+    finally:
+        workspace.close_workspace()
+        pump_until(lambda: workspace.io.runtime.closed)
+
+
+def test_string_edit_does_not_prefill_mask_or_partial_chunk(qapp, services, wire, monkeypatch):
+    workspace, console, session, profile = _open_connected_workspace(qapp, services)
+    try:
+        _open_key(workspace, b"token:abc")
+        displayed = workspace.detail.string_view.body.toPlainText()
+        assert "已遮罩" in displayed
+        prompts = []
+        _accept_confirm(monkeypatch, accepted=True)
+        _capture_multiline(monkeypatch, "new-secret", prompts)
+        workspace.detail.string_edit.click()
+        pump_until(lambda: any(p == [b"SET", b"token:abc", b"new-secret"] for p in wire.commands) and not workspace.console.busy)
+        initial = prompts[0]["args"][3] if len(prompts[0]["args"]) > 3 else prompts[0]["kwargs"].get("text", "")
+        assert initial == ""
+        assert "已遮罩" not in initial
+        assert not any(b"\xe2\x97\x8f" in (p[2] if len(p) > 2 else b"") for p in wire.commands if p[0] == b"SET")
+
+        wire.string_value = b"a" * 70000
+        _open_key(workspace, b"large")
+        pump_until(lambda: workspace.detail.last_value is not None and workspace.detail.last_value.get("more"))
+        prompts.clear()
+        _capture_multiline(monkeypatch, "replacement", prompts)
+        workspace.detail.string_edit.click()
+        pump_until(lambda: any(p == [b"SET", b"large", b"replacement"] for p in wire.commands) and not workspace.console.busy)
+        initial = prompts[0]["args"][3] if len(prompts[0]["args"]) > 3 else prompts[0]["kwargs"].get("text", "")
+        assert initial == ""
+        assert len(initial) != 65536
     finally:
         workspace.close_workspace()
         pump_until(lambda: workspace.io.runtime.closed)
