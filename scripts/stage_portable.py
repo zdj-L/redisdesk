@@ -4,6 +4,8 @@ import hashlib
 import importlib.metadata as md
 import json
 from pathlib import Path
+import argparse
+import os
 import shutil
 import sys
 import zipfile
@@ -28,7 +30,60 @@ def zip_allowlist(destination, base, names):
             archive.writestr(info, data, compresslevel=9)
 
 
-def main():
+
+REQUIRED_SOURCE_EXTRAS = (
+    'docs/INTERNAL_PORTABLE.md',
+    'docs/release-licenses/GPL-3.0-only.txt',
+    'docs/release-licenses/LGPL-3.0-only.txt',
+    'pyproject.toml',
+    'scripts/build_nuitka.ps1',
+    'scripts/portable_entry.py',
+    'scripts/stage_portable.py',
+)
+
+
+def iter_source_paths(root: Path) -> list[str]:
+    names: list[str] = []
+    package = root / 'redisdesk'
+    for path in sorted(package.rglob('*.py')):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if any(part.lower() in {'__pycache__', 'logs', '.git', 'tests', 'data'} for part in rel.parts):
+            continue
+        names.append(rel.as_posix())
+    for extra in REQUIRED_SOURCE_EXTRAS:
+        if not (root / extra).is_file():
+            raise SystemExit(f'Missing required source: {extra}')
+        if extra not in names:
+            names.append(extra)
+    return names
+
+
+def write_source_allowlist(destination: Path) -> None:
+    items = []
+    for name in iter_source_paths(ROOT):
+        path = ROOT / name
+        items.append({'path': name, 'sha256': sha(path), 'size': path.stat().st_size})
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(items, indent=2) + '\n', encoding='utf-8')
+
+
+def should_refresh_allowlist(flag: bool) -> bool:
+    env = os.environ.get('REDISDESK_REFRESH_SOURCE_ALLOWLIST', '').strip().lower()
+    return flag or env in {'1', 'true', 'yes', 'on'}
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description='Stage RedisDesk portable release files')
+    parser.add_argument('--refresh-allowlist', action='store_true', help='Rebuild artifacts/release-source-allowlist.json from current sources')
+    args = parser.parse_args(argv)
+    allowlist_path = ARTIFACTS / 'release-source-allowlist.json'
+    if should_refresh_allowlist(args.refresh_allowlist) or not allowlist_path.is_file():
+        if not allowlist_path.is_file() and not should_refresh_allowlist(args.refresh_allowlist):
+            raise SystemExit('Missing artifacts/release-source-allowlist.json (pass --refresh-allowlist in CI)')
+        write_source_allowlist(allowlist_path)
+    source_items = json.loads(allowlist_path.read_text(encoding='utf-8'))
     if RELEASE.exists():
         raise SystemExit(f'Refusing to overwrite existing release: {RELEASE}')
     if not (RUNTIME / 'RedisDesk.exe').is_file():
@@ -85,7 +140,6 @@ def main():
     (RELEASE / 'THIRD-PARTY-NOTICES.txt').write_text('\n'.join(notices) + '\nQt/PySide are unmodified dynamically linked libraries. See LICENSES; upstream sources: https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.8.2.1-src/ and https://download.qt.io/archive/qt/6.8/ .\n', encoding='utf-8')
     shutil.copyfile(ROOT / 'docs' / 'INTERNAL_PORTABLE.md', RELEASE / 'README-INTERNAL.md')
     shutil.copyfile(ARTIFACTS / 'build-requirements.lock.txt', RELEASE / 'BUILD-REQUIREMENTS.txt')
-    source_items = json.loads((ARTIFACTS / 'release-source-allowlist.json').read_text(encoding='utf-8'))
     for item in source_items:
         assert sha(ROOT / item['path']) == item['sha256'], f'Source changed since manifest: {item["path"]}'
     source_zip = ROOT / 'release' / f'RedisDesk-{__version__}-internal-source.zip'
